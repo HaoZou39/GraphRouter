@@ -1,0 +1,21 @@
+{
+    "user_model": {
+        "max_curb_height": 0.04,
+        "min_sidewalk_width": 0.8,
+        "walk_bike_preference": "walk",
+        "attrs_variable_names": [
+            "path_type",
+            "curb_height_max",
+            "obstacle_free_width_float"
+        ],
+        "crossing_weight_factor": 1.4,
+        "walk_bike_preference_weight_factor": 0.6,
+        "route_error_threshold": 0.05
+    },
+    "map": {
+        "CRS": "EPSG:28992",
+        "CRS_map": "EPSG:4326",
+        "area_choice": "wijken",
+        "my_areas": []
+    }
+}

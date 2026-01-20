@@ -1,0 +1,27 @@
+{
+  "summary": {
+    "overall_score": 0.85,
+    "grade": "B",
+    "nodes": 425,
+    "edges": 560
+  },
+  "categories": {
+    "topology": {
+      "overall_score": 0.8,
+      "status": "Generated grid-based topology"
+    },
+    "geometry": {
+      "overall_score": 0.9,
+      "status": "Normalized coordinates"
+    },
+    "attributes": {
+      "overall_score": 0.8,
+      "status": "Synthetic attributes with uncertainty"
+    }
+  },
+  "warnings": [],
+  "recommendations": [
+    "Generated synthetic graph with realistic attribute distributions",
+    "Consider fine-tuning attribute priors for specific city types"
+  ]
+}

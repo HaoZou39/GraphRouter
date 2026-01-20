@@ -13,35 +13,57 @@ class Router:
         self.CRS_map = CRS_map
 
     def extract_shortest_path_edges(self, G, node_route, heuristic_f):
+        if len(node_route) < 2:
+            # Invalid route: must have at least 2 nodes to form a path
+            # This indicates the OD pair is invalid or too close
+            raise ValueError(f"Invalid route with {len(node_route)} nodes: need at least 2 nodes for a valid path")
+
         edge_route = []
         for u, v in zip(node_route[:-1], node_route[1:]):
             # Get all edges between consecutive nodes
             edges = G.get_edge_data(u, v)
-            
+
+            if edges is None:
+                # No edge between these nodes - invalid path
+                raise ValueError(f"No edge found between nodes {u} and {v} in route")
+
             # If multiple edges exist, choose the one with minimal weight
-            min_edge = min(edges.values(), 
+            min_edge = min(edges.values(),
                         key=lambda x: x.get(heuristic_f, 1))
             edge_route.append((u, v, min_edge))
 
-            # Create a new graph with only the relevant edges
-            G_route = nx.DiGraph() if G.is_directed() else nx.Graph()
-            G_route.add_nodes_from(node_route)
-            G_route.add_edges_from([(u, v, attr) for u, v, attr in edge_route])
+        if not edge_route:
+            # No valid edges found in the route
+            raise ValueError("No valid edges found in the computed route")
 
-            # Convert to GeoDataFrame
+        # Create a new graph with only the relevant edges
+        G_route = nx.DiGraph() if G.is_directed() else nx.Graph()
+        G_route.add_nodes_from(node_route)
+        G_route.add_edges_from([(u, v, attr) for u, v, attr in edge_route])
+
+        # Convert to GeoDataFrame
         G_route.graph["approach"] = "primal"
         df_route = momepy.nx_to_gdf(G_route, lines=True, points=False)
         return G_route, df_route
     
     def get_route(self, G, origin_node, dest_node, heuristic_f='my_weight'):
-        if self.heuristic == "dijkstra":
-            route = nx.shortest_path(G, origin_node, dest_node, weight=heuristic_f)
-        else:
-            raise NotImplementedError(f"Heuristic function {self.heuristic} not implemented")
-        # G_route = nx.subgraph(G, route).copy()
-        # df_route = momepy.nx_to_gdf(G_route, lines=True, points=False)
-        G_route, df_route = self.extract_shortest_path_edges(G, route, heuristic_f)
-        return route, G_route, df_route
+        try:
+            if self.heuristic == "dijkstra":
+                route = nx.shortest_path(G, origin_node, dest_node, weight=heuristic_f)
+            else:
+                raise NotImplementedError(f"Heuristic function {self.heuristic} not implemented")
+
+            G_route, df_route = self.extract_shortest_path_edges(G, route, heuristic_f)
+            return route, G_route, df_route
+
+        except nx.NetworkXNoPath:
+            # No path exists between origin and destination
+            error_msg = f"No path between {origin_node} and {dest_node}"
+            raise ValueError(error_msg)
+        except Exception as e:
+            # Handle other potential errors
+            error_msg = f"Error finding route between {origin_node} and {dest_node}: {str(e)}"
+            raise ValueError(error_msg)
 
 
     def set_o_d_coords_crs(self, G, origin_coords, dest_coords):
