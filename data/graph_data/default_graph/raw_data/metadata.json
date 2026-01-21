@@ -13,6 +13,7 @@
         "route_error_threshold": 0.05
     },
     "map": {
+        "map_name": "osdpm_map.gpkg",
         "CRS": "EPSG:28992",
         "CRS_map": "EPSG:4326",
         "area_choice": "wijken",

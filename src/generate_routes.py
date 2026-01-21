@@ -17,6 +17,8 @@ from random import uniform
 from collections import Counter
 import shutil
 import random
+import pickle
+import numpy as np
 
 def save_route_to_file(gdf_route: gpd.GeoDataFrame, store_path: str, route_id: int, crs: str = None) -> None:
     """Save route to file with simplified naming and CRS."""
@@ -105,7 +107,7 @@ def generate_route_with_retry(
     meta_map = meta_data["map"]
     df_copy = deepcopy(df)
     df_copy = handle_weight(df_copy, user_model)
-    _, G = create_network_graph(df_copy)
+    _, G = create_network_graph(df_copy, use_directed=False)
 
     # Pre-compute connected components for efficiency
     if G.is_directed():
@@ -141,6 +143,17 @@ def generate_route_with_retry(
 
             # Try to find the route
             path_fact, G_path_fact, df_path_fact = router_h.get_route(G, origin_node, dest_node, heuristic_f)
+
+            # Check if the generated path forms a loop (start == end)
+            if len(df_path_fact) > 0:
+                first_edge = df_path_fact.iloc[0].geometry
+                last_edge = df_path_fact.iloc[-1].geometry
+                path_start = (first_edge.coords[0][0], first_edge.coords[0][1])
+                path_end = (last_edge.coords[-1][0], last_edge.coords[-1][1])
+                
+                if path_start == path_end:
+                    # Path forms a loop, retry with new OD pair
+                    continue
 
             return {
                 "path_fact": path_fact,
@@ -471,7 +484,7 @@ def main():
                        help='Data directory path (default: ../data)')
     parser.add_argument('--graph_id', type=str, default='default_graph',
                        help='Graph identifier for multi-graph support (default: default_graph)')
-    parser.add_argument('--num_routes', type=int, default=10000,
+    parser.add_argument('--num_routes', type=int, default=100,
                        help='Number of routes to generate (default: 10000)')
     parser.add_argument('--train_ratio', type=float, default=0.8,
                        help='Training set ratio (default: 0.8)')
@@ -500,34 +513,234 @@ def main():
     print(f"Number of routes: {num_routes}")
     print(f"Split ratios - Train: {train_ratio}, Val: {val_ratio}, Test: {test_ratio}")
     print()
-    
+
     # Create temporary directory for initial route generation
     temp_dir = os.path.join(data_directory, 'temp_routes')
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     try:
         # Load data from graph-specific directory
         print("📂 Loading map data...")
         data = load_data(data_directory, graph_id)
         df, meta_data = data["df"], data["meta_data"]
         print(f"✅ Loaded map data: {len(df)} edges")
+
+        # Check if cache exists, generate if not
+        cache_dir = os.path.join(data_directory, 'graph_data', graph_id, 'cache')
+        cache_exists = os.path.exists(cache_dir) and os.path.exists(os.path.join(cache_dir, 'graph_cache.pkl'))
+
+        if not cache_exists:
+            print(f"📦 Cache not found for graph '{graph_id}', generating cache files...")
+            generate_graph_cache(df, meta_data, data_directory, graph_id)
+            print("✅ Cache files generated!")
+        else:
+            print(f"📦 Using existing cache for graph '{graph_id}'")
+
         # Batch generate unique routes
         print(f"\n🔄 Generating {num_routes} unique routes...")
         batch_generate_routes(num_routes, df, meta_data, temp_dir)
-        
+
         # Split dataset into graph-specific directories
         print(f"\n📊 Splitting dataset into train/val/test for graph '{graph_id}'...")
         split_dataset_with_matching_files(temp_dir, data_directory, graph_id, train_ratio, val_ratio, test_ratio)
-        
+
         print("\n" + "=" * 80)
         print("✅ Route generation and splitting completed!")
         print("=" * 80)
-        
+
     finally:
         # Clean up temporary directory
         if os.path.exists(temp_dir):
             print(f"\n🧹 Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir)
+
+
+def generate_graph_cache(df: gpd.GeoDataFrame, meta_data: Dict[str, Any], data_directory: str, graph_id: str):
+    """
+    Generate all necessary cache files for graph preprocessing.
+
+    Args:
+        df: Road network GeoDataFrame
+        meta_data: Map metadata
+        data_directory: Base data directory
+        graph_id: Graph identifier
+    """
+    from utils.graph_cache import GraphCache
+    import momepy
+
+    # Create cache directory
+    cache_dir = os.path.join(data_directory, 'graph_data', graph_id, 'cache')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    print(f"   Creating cache files in: {cache_dir}")
+
+    # Build graph from original data WITHOUT applying user constraints
+    # This ensures we cache all edges (data-driven, not rule-driven)
+    G_con, _ = create_network_graph(df, use_directed=False)
+    
+    # Use the full undirected graph for caching (no filtering by user constraints)
+    G = G_con
+
+    # Get coordinate bounds for normalization
+    coords = list(G.nodes())
+    x_coords = [coord[0] for coord in coords]
+    y_coords = [coord[1] for coord in coords]
+
+    coord_stats = {
+        'x_min': min(x_coords),
+        'x_max': max(x_coords),
+        'y_min': min(y_coords),
+        'y_max': max(y_coords),
+        'x_range': max(x_coords) - min(x_coords),
+        'y_range': max(y_coords) - min(y_coords)
+    }
+
+    # Normalize coordinates
+    def normalize_coord(coord):
+        x_norm = (coord[0] - coord_stats['x_min']) / coord_stats['x_range'] if coord_stats['x_range'] > 0 else 0.5
+        y_norm = (coord[1] - coord_stats['y_min']) / coord_stats['y_range'] if coord_stats['y_range'] > 0 else 0.5
+        return (x_norm, y_norm)
+
+    # Create normalized graph
+    G_norm = nx.Graph()
+    for u, v, edge_data in G.edges(data=True):
+        u_norm = normalize_coord(u)
+        v_norm = normalize_coord(v)
+        G_norm.add_edge(u_norm, v_norm, **edge_data)
+
+    # First pass: collect raw data for statistics
+    edge_lengths = []
+    curb_heights = []
+
+    # Create mapping from original edge coordinates to dataframe indices for faster lookup
+    edge_to_df_idx = {}
+    for idx, row in df.iterrows():
+        geom = row.geometry
+        if geom is not None and hasattr(geom, 'coords'):
+            coords_geom = list(geom.coords)
+            if len(coords_geom) >= 2:
+                start_coord = (coords_geom[0][0], coords_geom[0][1])
+                end_coord = (coords_geom[-1][0], coords_geom[-1][1])
+                edge_to_df_idx[(start_coord, end_coord)] = idx
+
+    for u, v, edge_data in G.edges(data=True):
+        # Extract edge attributes for statistics
+        length = edge_data.get('length', 1.0)
+        edge_lengths.append(length)
+
+        # Try to find matching row in dataframe
+        df_idx = edge_to_df_idx.get((u, v))
+        if df_idx is not None:
+            row = df.loc[df_idx]
+            curb_height = row.get('curb_height_max', 0.0)
+            # Ensure NaN values are converted to 0.0
+            if pd.isna(curb_height):
+                curb_height = 0.0
+            curb_heights.append(curb_height)
+        else:
+            curb_heights.append(0.0)
+
+    # Calculate normalization parameters from collected data
+    max_length = max(edge_lengths) if edge_lengths else 1.0
+    curb_max = max(curb_heights) if curb_heights else 0.04  # Use 0.04 as fallback if no curb data
+
+    # Second pass: build edge mappings and normalized features
+    edge_id_map = {}
+    edge_feature_list = []
+
+    edge_id_counter = 0
+    for u, v, edge_data in G.edges(data=True):
+        # Create edge ID mapping with normalized coordinates
+        u_norm = normalize_coord(u)
+        v_norm = normalize_coord(v)
+        edge_id_map[(u_norm, v_norm)] = edge_id_counter
+
+        # Extract and normalize features
+        length = edge_data.get('length', 1.0)
+        length_norm = length / max_length
+
+        # Get other features
+        df_idx = edge_to_df_idx.get((u, v))
+        if df_idx is not None:
+            row = df.loc[df_idx]
+            width = row.get('obstacle_free_width_float', 1.0)
+            curb_height = row.get('curb_height_max', 0.0)
+            # Ensure NaN values are converted to 0.0
+            if pd.isna(curb_height):
+                curb_height = 0.0
+            curb_norm = curb_height / curb_max if curb_max > 0 else 0.0
+            crossing = 1 if row.get('crossing', 'No') == 'Yes' else 0
+            # Encode path_type: walk=0, bike=1, walk_bike_connection=2
+            path_type_str = str(row.get('path_type', ''))
+            if path_type_str == 'walk':
+                path_type = 0
+            elif path_type_str == 'bike':
+                path_type = 1
+            elif path_type_str == 'walk_bike_connection':
+                path_type = 2
+            else:
+                path_type = 0  # default to walk
+        else:
+            # Default values if no matching row found
+            width = 1.0
+            curb_norm = 0.0
+            crossing = 0
+            path_type = 0
+
+        edge_feature_list.append([
+            length_norm,  # length_norm
+            width,        # width
+            curb_norm,    # curb_norm
+            crossing,     # crossing
+            path_type     # path_type
+        ])
+
+        edge_id_counter += 1
+
+    # Filter out NaN values from curb_heights
+    curb_heights_clean = [h for h in curb_heights if not np.isnan(h)] if curb_heights else []
+
+    # Calculate physical statistics
+    physical_stats = {
+        'num_nodes': len(G_norm.nodes()),
+        'num_edges': len(G_norm.edges()),
+        'avg_degree': sum(dict(G_norm.degree()).values()) / len(G_norm.nodes()) if G_norm.nodes() else 0,
+        'edge_length_mean_m': np.mean(edge_lengths) if edge_lengths else 0,
+        'edge_length_std_m': np.std(edge_lengths) if edge_lengths else 0,
+        'edge_length_max_m': max(edge_lengths) if edge_lengths else 1.0,
+        'curb_height_mean_m': np.mean(curb_heights_clean) if curb_heights_clean else 0,
+        'curb_height_std_m': np.std(curb_heights_clean) if curb_heights_clean else 0,
+        'curb_height_max_m': max(curb_heights_clean) if curb_heights_clean else 0.04,
+        'total_length_m': sum(edge_lengths) if edge_lengths else 0
+    }
+
+    # Save individual cache files
+    print("   Saving edge_id_map.pkl...")
+    with open(os.path.join(cache_dir, 'edge_id_map.pkl'), 'wb') as f:
+        pickle.dump(edge_id_map, f)
+
+    print("   Saving edge_feature_list.pkl...")
+    with open(os.path.join(cache_dir, 'edge_feature_list.pkl'), 'wb') as f:
+        pickle.dump(edge_feature_list, f)
+
+    print("   Saving coordinate_stats.json...")
+    with open(os.path.join(cache_dir, 'coordinate_stats.json'), 'w') as f:
+        json.dump(coord_stats, f, indent=2)
+
+    print("   Saving physical_stats.json...")
+    with open(os.path.join(cache_dir, 'physical_stats.json'), 'w') as f:
+        json.dump(physical_stats, f, indent=2)
+
+    # Create and save GraphCache
+    print("   Creating GraphCache...")
+    graph_cache = GraphCache()
+    graph_cache.build_from_networkx(G_norm, edge_id_map, edge_feature_list, coord_stats, physical_stats)
+
+    print("   Saving graph_cache.pkl...")
+    graph_cache.save_to_file(os.path.join(cache_dir, 'graph_cache.pkl'))
+
+    print(f"   ✅ Cache files created: {len(G_norm.nodes())} nodes, {len(G_norm.edges())} edges")
+
 
 if __name__ == "__main__":
     main()
