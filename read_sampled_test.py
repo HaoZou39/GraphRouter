@@ -8,7 +8,7 @@ import os
 
 def read_sampled_test_head():
     # 文件路径
-    file_path = "data/graph_data/default_graph/trajectories/sampled_test.df"
+    file_path = "data/graph_data/default_graph/trajectories/replay_buffer.df"
 
     # 检查文件是否存在
     if not os.path.exists(file_path):
@@ -26,10 +26,12 @@ def read_sampled_test_head():
         print("=" * 50)
 
         # 按route_id和step_id排序
-        df_sorted = df.sort_values(['route_id', 'step_id'])
+        # df_sorted = df.sort_values(['route_id', 'step_id'])
 
         print("前十行（按route_id和step_id排序）:")
-        print(df_sorted.head(10))
+        # 设置 pandas 显示选项，不省略中间的列
+        with pd.option_context('display.max_columns', None):
+            print(df.head(30))
 
         print("\n" + "=" * 80)
         print("数据分析：")

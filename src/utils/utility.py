@@ -121,3 +121,20 @@ def get_edge_id(edge, edge_id_map):
         Edge ID or None if not found
     """
     return edge_id_map.get(edge, edge_id_map.get((edge[1], edge[0]), None))
+
+
+def to_pickled_df(data_directory: str, **kwargs):
+    """
+    Save DataFrames to pickle files in the specified directory.
+    
+    Args:
+        data_directory: Directory to save files
+        **kwargs: Named DataFrames to save (e.g., replay_buffer=df, data_statis=df)
+    """
+    os.makedirs(data_directory, exist_ok=True)
+    
+    for name, df in kwargs.items():
+        if df is not None:
+            file_path = os.path.join(data_directory, f'{name}.df')
+            df.to_pickle(file_path)
+            print(f"Saved {name} to {file_path}")

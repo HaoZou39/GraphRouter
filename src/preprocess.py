@@ -54,12 +54,13 @@ def load_normalization_stats(data_directory, graph_id='default_graph'):
 
 
 def normalize_coordinate(coord, coord_stats):
-    """Normalize a single coordinate"""
+    """Normalize a single coordinate using min/max normalization"""
     if coord_stats is None:
         return coord
     x, y = coord
-    x_norm = (x - coord_stats['x_mean']) / coord_stats['x_std']
-    y_norm = (y - coord_stats['y_mean']) / coord_stats['y_std']
+    # Use min/max normalization (same as generate_routes.py)
+    x_norm = (x - coord_stats['x_min']) / coord_stats['x_range'] if coord_stats['x_range'] > 0 else 0.5
+    y_norm = (y - coord_stats['y_min']) / coord_stats['y_range'] if coord_stats['y_range'] > 0 else 0.5
     return (x_norm, y_norm)
 
 
@@ -94,31 +95,39 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
     csv_name = base_name.replace('p_', '').replace('.gpkg', '_start_end.csv')
     start_end_csv_path = os.path.join(os.path.dirname(file_path), csv_name)
 
-    # Load start/end coordinates from GPKG file
+    # Load start/end coordinates from corresponding CSV file
     start_coord = None
     end_coord = None
 
     try:
-        # Load the route geometry from GPKG
-        route_gdf = gpd.read_file(file_path)
-
-        if not route_gdf.empty and len(route_gdf) > 0:
-            # Get the first and last edges to find start and end points
-            first_edge = route_gdf.iloc[0].geometry
-            last_edge = route_gdf.iloc[-1].geometry
-
-            if hasattr(first_edge, 'coords') and hasattr(last_edge, 'coords'):
-                first_coords = list(first_edge.coords)
-                last_coords = list(last_edge.coords)
-
-                if first_coords and last_coords:
-                    # Start point is the first coordinate of the first edge
-                    start_coord = tuple(first_coords[0])
-                    # End point is the last coordinate of the last edge
-                    end_coord = tuple(last_coords[-1])
+        if os.path.exists(start_end_csv_path):
+            # Read CSV with start/end coordinates
+            df_coords = pd.read_csv(start_end_csv_path, sep=';')
+            
+            # Parse origin_node geometry (start point)
+            origin_row = df_coords[df_coords['coordinates'] == 'origin_node']
+            if not origin_row.empty:
+                origin_geom = origin_row['geometry'].values[0]
+                # Parse "POINT (x y)" format
+                coords_str = origin_geom.replace('POINT (', '').replace(')', '')
+                x, y = map(float, coords_str.split())
+                start_coord = (x, y)
+            
+            # Parse destination_node geometry (end point)
+            dest_row = df_coords[df_coords['coordinates'] == 'destination_node']
+            if not dest_row.empty:
+                dest_geom = dest_row['geometry'].values[0]
+                # Parse "POINT (x y)" format
+                coords_str = dest_geom.replace('POINT (', '').replace(')', '')
+                x, y = map(float, coords_str.split())
+                end_coord = (x, y)
+        else:
+            print(f"Warning: CSV file not found: {start_end_csv_path}")
+            return pd.DataFrame()
 
     except Exception as e:
-        print(f"Error loading coordinates from GPKG: {e}")
+        print(f"Error loading coordinates from CSV {start_end_csv_path}: {e}")
+        return pd.DataFrame()
 
     if start_coord is None or end_coord is None:
         print(f"Warning: Could not load start/end coordinates for {file_path}")
@@ -130,24 +139,28 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
     end_norm = normalize_coordinate(end_coord, coord_stats)
 
     # Find closest nodes with tolerance for floating point precision issues
-    def find_closest_node(coord, tolerance=1e-6):
+    def find_closest_node(coord, tolerance=1e-3):
         """Find the closest node to a coordinate within tolerance."""
         # First try exact match
         node_id = graph_cache.node_id_map.get(coord)
         if node_id is not None:
             return node_id
 
-        # If no exact match, find closest within tolerance
+        # If no exact match, find closest node
         min_dist = float('inf')
         closest_node_id = None
 
         for graph_coord, node_id in graph_cache.node_id_map.items():
             dist = ((graph_coord[0] - coord[0])**2 + (graph_coord[1] - coord[1])**2)**0.5
-            if dist < min_dist and dist < tolerance:
+            if dist < min_dist:
                 min_dist = dist
                 closest_node_id = node_id
 
-        return closest_node_id
+        # Only return if within tolerance
+        if min_dist < tolerance:
+            return closest_node_id
+        else:
+            return None
 
     start_node_id = find_closest_node(start_norm)
     goal_node_id = find_closest_node(end_norm)
@@ -161,24 +174,36 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
     # Check if this is a loop route (start == goal)
     is_loop = (start_node_id == goal_node_id)
     
-    # Process trajectory using actual edge sequence from GPKG
+    # Process trajectory by following edges in GPKG order
     trajectory_rows = []
     cur_node_id = start_node_id
+    step_counter = 0
     
-    for step_idx, row in gdf.iterrows():
+    for df_idx, row in gdf.iterrows():
         geom = row['geometry']
         if geom is None or geom.is_empty:
             continue
         
         # Normalize edge coordinates
-        edge_start = normalize_coordinate((geom.coords[0][0], geom.coords[0][1]), coord_stats)
-        edge_end = normalize_coordinate((geom.coords[-1][0], geom.coords[-1][1]), coord_stats)
+        edge_coord_0 = normalize_coordinate((geom.coords[0][0], geom.coords[0][1]), coord_stats)
+        edge_coord_1 = normalize_coordinate((geom.coords[-1][0], geom.coords[-1][1]), coord_stats)
         
-        # Find node IDs for this edge
-        edge_start_node = find_closest_node(edge_start)
-        edge_end_node = find_closest_node(edge_end)
+        # Find node IDs for both endpoints
+        node_0 = find_closest_node(edge_coord_0)
+        node_1 = find_closest_node(edge_coord_1)
         
-        if edge_start_node is None or edge_end_node is None:
+        if node_0 is None or node_1 is None:
+            continue
+        
+        # Determine which endpoint matches current node and find next node
+        if node_0 == cur_node_id:
+            next_node_id = node_1
+            edge_start_node, edge_end_node = node_0, node_1
+        elif node_1 == cur_node_id:
+            next_node_id = node_0
+            edge_start_node, edge_end_node = node_1, node_0
+        else:
+            # Edge doesn't connect to current node - skip
             continue
         
         # Find edge_id in graph
@@ -192,20 +217,10 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
         if edge_id is None:
             continue
         
-        # Determine next node based on current position and edge direction
-        if edge_start_node == cur_node_id:
-            next_node_id = edge_end_node
-        elif edge_end_node == cur_node_id:
-            next_node_id = edge_start_node
-        else:
-            # Edge not connected to current node - try to fix by using edge start
-            cur_node_id = edge_start_node
-            next_node_id = edge_end_node
-        
-        # For loop routes, calculate dist_to_goal as remaining path length
+        # Calculate distance to goal from current node (before taking action)
         if is_loop:
-            # For loops, use a small non-zero distance to avoid division by zero
-            dist_to_goal = max(0.001, len(gdf) - step_idx)
+            # For loops, use remaining steps as distance
+            dist_to_goal = max(0.001, len(gdf) - step_counter)
         else:
             dist_to_goal = graph_cache.get_dist_to_goal(cur_node_id, goal_node_id)
         
@@ -213,7 +228,7 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
         trajectory_row = {
             'graph_id': graph_id,
             'route_id': route_id,
-            'step_id': step_idx,
+            'step_id': step_counter,
             'start_node_id': start_node_id,
             'goal_node_id': goal_node_id,
             'cur_node_id': cur_node_id,
@@ -223,8 +238,13 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
         }
         trajectory_rows.append(trajectory_row)
         
+        # If we reached the goal, stop immediately (don't record terminal state as cur_node)
+        if next_node_id == goal_node_id:
+            break
+        
         # Move to next node
         cur_node_id = next_node_id
+        step_counter += 1
 
     return pd.DataFrame(trajectory_rows)
 

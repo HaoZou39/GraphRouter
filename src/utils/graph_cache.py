@@ -80,9 +80,15 @@ class GraphCache:
             self.edge_id_to_nodes[edge_id] = (u_node_id, v_node_id)
 
             # Build reverse mapping (node -> outgoing edges)
+            # For undirected graphs, add edge to both nodes' outgoing edge lists
             if u_node_id not in self.node_out_edges:
                 self.node_out_edges[u_node_id] = []
             self.node_out_edges[u_node_id].append(edge_id)
+            
+            # Add edge to v_node as well (for undirected graphs)
+            if v_node_id not in self.node_out_edges:
+                self.node_out_edges[v_node_id] = []
+            self.node_out_edges[v_node_id].append(edge_id)
 
         # Sort outgoing edges for stable ordering
         for node_id in self.node_out_edges:

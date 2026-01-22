@@ -484,7 +484,7 @@ def main():
                        help='Data directory path (default: ../data)')
     parser.add_argument('--graph_id', type=str, default='default_graph',
                        help='Graph identifier for multi-graph support (default: default_graph)')
-    parser.add_argument('--num_routes', type=int, default=100,
+    parser.add_argument('--num_routes', type=int, default=1000,
                        help='Number of routes to generate (default: 10000)')
     parser.add_argument('--train_ratio', type=float, default=0.8,
                        help='Training set ratio (default: 0.8)')

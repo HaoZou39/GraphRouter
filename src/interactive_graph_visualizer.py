@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import pickle
 from pathlib import Path
 import argparse
+from utils.graph_cache import GraphCache
 
 class InteractiveGraphVisualizer:
     def __init__(self, graph_id="default_graph", base_data_dir="../data/graph_data"):
@@ -32,8 +33,8 @@ class InteractiveGraphVisualizer:
         cache_file = cache_dir / "graph_cache.pkl"
         if cache_file.exists():
             try:
-                with open(cache_file, 'rb') as f:
-                    self.graph_cache = pickle.load(f)
+                self.graph_cache = GraphCache()
+                self.graph_cache.load_from_file(str(cache_file))
                 print(f"Loaded graph_cache format: {self.graph_cache.get_node_count()} nodes, {self.graph_cache.get_edge_count()} edges")
 
                 # 同时加载edge_feature_list（归一化数据，用于特殊边检测）
@@ -42,13 +43,13 @@ class InteractiveGraphVisualizer:
                     try:
                         with open(edge_feature_file, 'rb') as f:
                             self.edge_feature_list = pickle.load(f)
-                        print(f"✓ Also loaded edge_feature_list with {len(self.edge_feature_list)} features")
+                        print(f"[+] Also loaded edge_feature_list with {len(self.edge_feature_list)} features")
                     except Exception as e:
-                        print(f"✗ Failed to load edge_feature_list: {e}")
+                        print(f"[-] Failed to load edge_feature_list: {e}")
                         print("Continuing without edge_feature_list (special edge highlighting will be disabled)")
                         self.edge_feature_list = None
                 else:
-                    print(f"✗ edge_feature_list.pkl not found at {edge_feature_file}")
+                    print(f"[-] edge_feature_list.pkl not found at {edge_feature_file}")
                     print("Will use graph_cache.edge_attrs instead")
 
                 return
