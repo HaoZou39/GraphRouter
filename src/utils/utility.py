@@ -472,3 +472,119 @@ def generate_action_mask_batch(states, G, edge_id_map, item_num, debug_output=Fa
     # 🔥 新格式数据：直接返回全1掩码（候选边已在数据中指定）
     masks = np.ones((batch_size, item_num), dtype=np.float32)
     return masks
+
+def preload_all_datasets(data_directory='../data', user_id=None, moe_data_dir='examples/moe_data/processed', edge_id_map=None, state_size=10, graph_id='default_graph'):
+    """
+    预加载所有数据集并缓存，用于提升后续评估性能
+    
+    Args:
+        data_directory: Data directory for map/graph data
+        user_id: User ID for MOE mode (default: None)
+        moe_data_dir: MOE data root directory (default: 'examples/moe_data/processed')
+        edge_id_map: Edge ID mapping (optional)
+        state_size: State size (history length, default: 10)
+        graph_id: Graph identifier (default: 'default_graph')
+    """
+    print("Preloading all datasets for caching...")
+    
+    # 如果没有提供edge_id_map，尝试加载
+    if edge_id_map is None:
+        try:
+            raw_data_dir = os.path.join(data_directory, 'graph_data', graph_id, 'raw_data')
+            data = load_map_data(raw_data_dir)
+            df, meta_data = data["df"], data["meta_data"]
+            G, edge_id_map, edge_feature_list = load_or_create_graph(df.copy(), data_directory, graph_id)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load edge_id_map: {e}")
+            edge_id_map = None
+    
+    datasets = ['train', 'val', 'test']
+    cache_dir = os.path.join(data_directory, 'evaluation_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    for dataset in datasets:
+        print(f"\nProcessing {dataset} dataset...")
+        
+        # 检查是否已有缓存
+        # 🔥 修复：在cache文件名中包含user_id，避免不同用户数据混淆
+        if user_id is not None:
+            cache_file = os.path.join(cache_dir, f'{dataset}_batch_data_{user_id}.pkl')
+        else:
+            cache_file = os.path.join(cache_dir, f'{dataset}_batch_data.pkl')
+        if os.path.exists(cache_file):
+            continue
+        
+        # 构建数据
+        dataset_files = {
+            'train': 'sampled_train.df',
+            'val': 'sampled_val.df', 
+            'test': 'sampled_test.df'
+        }
+        
+        data_file = dataset_files[dataset]
+        # 支持MOE模式
+        eval_data_path = get_moe_data_path(data_directory, user_id, moe_data_dir, data_file)
+        if not os.path.exists(eval_data_path):
+            print(f"⚠️  Skipping {dataset} dataset (file not found: {eval_data_path})")
+            continue
+        eval_sessions = pd.read_pickle(eval_data_path)
+        eval_ids = eval_sessions.route_id.unique()
+        
+        print(f'Building data for {len(eval_ids)} paths...')
+        
+        # 加载 graph_cache 和 feature_builder（用于新格式数据）
+        graph_cache = None
+        feature_builder = None
+        try:
+            from utils.graph_cache import MultiGraphCache
+            multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
+            graph_cache = multi_cache.get_cache(graph_id)
+            feature_builder = multi_cache.get_feature_builder(graph_id)
+        except Exception as e:
+            print(f'⚠️  Could not load GraphCache/FeatureBuilder: {e}')
+        
+        all_path_data = []
+        all_path_actions = []
+        all_path_len_states = []
+        all_path_lengths = []
+        all_path_user_ids = []
+        all_cand_edges = []
+        all_bc_indices = []
+        
+        for route_id in eval_ids:
+            group = eval_sessions[eval_sessions['route_id'] == route_id]
+            if len(group) == 0:
+                continue
+            
+            path_states, path_actions, path_len_states, path_length, path_user_ids, path_cand_edges, path_bc_indices = build_path_data_for_batch(
+                group, state_size=state_size, edge_id_map=edge_id_map,
+                graph_cache=graph_cache, feature_builder=feature_builder
+            )
+            all_path_data.extend(path_states)
+            all_path_actions.extend(path_actions)
+            all_path_user_ids.extend(path_user_ids)
+            all_cand_edges.extend(path_cand_edges)
+            all_bc_indices.extend(path_bc_indices)
+            all_path_len_states.extend(path_len_states)
+            all_path_lengths.append(path_length)
+        
+        # 保存缓存
+        cached_data = {
+            'path_data': all_path_data,
+            'path_actions': all_path_actions,
+            'path_len_states': all_path_len_states,
+            'path_lengths': all_path_lengths,
+            'path_user_ids': all_path_user_ids,
+            'cand_edges': all_cand_edges,
+            'bc_indices': all_bc_indices,
+            'eval_ids': eval_ids,
+            'state_size': state_size
+        }
+        
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cached_data, f)
+        
+        print(f'{dataset} dataset cached: {len(all_path_data)} states')
+    
+    print(f"\nAll datasets preloaded")
+    print(f"Cache directory: {cache_dir}")
