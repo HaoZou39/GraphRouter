@@ -118,13 +118,21 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
             next_node_id = row['next_node_id']
             dist_to_goal = row['dist_to_goal']
 
-            # Build current state (with d_start)
-            state_features = feature_builder.build_state_features(
-                cur_node_id=cur_node_id,
-                goal_node_id=goal_node_id,
-                start_node_id=start_node_id,
-                d_start=d_start
-            )
+            # Build current state: history sequence [history_length, history_dim]
+            history_tokens = []
+            for hist_edge_id in history_edge_ids:
+                token = feature_builder.build_history_token(
+                    chosen_edge_id=hist_edge_id,
+                    prev_node_id=None,  # 使用静态特征
+                    recent_visited_nodes=None
+                )
+                history_tokens.append(token)
+            
+            # Pad to history_length
+            history_dim = feature_builder._get_history_dim()
+            pad_token = np.zeros(history_dim, dtype=np.float32)
+            history_tokens = pad_history(history_tokens, history_length, pad_token)
+            state_sequence = np.array(history_tokens, dtype=np.float32)  # [history_length, history_dim]
 
             # Get candidate edges for current node (for E-bucket BC training)
             cand_edge_ids = graph_cache.get_candidate_edges(cur_node_id)
@@ -134,14 +142,19 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
             if action_edge_id in cand_edge_ids:
                 bc_action_idx = cand_edge_ids.index(action_edge_id)
 
-            # Calculate next state
+            # Calculate next state: next history sequence
             next_history = history_edge_ids + [action_edge_id]
-            next_state_features = feature_builder.build_state_features(
-                cur_node_id=next_node_id,
-                goal_node_id=goal_node_id,
-                start_node_id=start_node_id,
-                d_start=d_start
-            )
+            next_history_tokens = []
+            for hist_edge_id in next_history:
+                token = feature_builder.build_history_token(
+                    chosen_edge_id=hist_edge_id,
+                    prev_node_id=None,
+                    recent_visited_nodes=None
+                )
+                next_history_tokens.append(token)
+            
+            next_history_tokens = pad_history(next_history_tokens, history_length, pad_token)
+            next_state_sequence = np.array(next_history_tokens, dtype=np.float32)
 
             # Calculate distances
             next_dist_to_goal = graph_cache.get_dist_to_goal(next_node_id, goal_node_id)
@@ -167,10 +180,10 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
             transitions['next_node_id'].append(next_node_id)
             transitions['reward'].append(reward)
             transitions['done'].append(done)
-            transitions['state'].append(state_features)
-            transitions['next_state'].append(next_state_features)
-            transitions['len_state'].append(min(len(history_edge_ids) + 1, history_length))
-            transitions['len_next_state'].append(min(len(next_history) + 1, history_length))
+            transitions['state'].append(state_sequence)  # [history_length, history_dim]
+            transitions['next_state'].append(next_state_sequence)
+            transitions['len_state'].append(min(len(history_edge_ids), history_length))
+            transitions['len_next_state'].append(min(len(next_history), history_length))
             transitions['d_cur'].append(dist_to_goal)
             transitions['d_next'].append(next_dist_to_goal)
             transitions['delta_d'].append(delta_d)
@@ -245,7 +258,8 @@ def main(argv):
 
     # Save data statistics
     state_size = length
-    feature_dim = feature_builder._get_feature_dim()  # State feature dimension
+    # feature_dim 应该是历史token维度（用于SASRec输入），不是候选特征维度
+    feature_dim = feature_builder._get_history_dim()
     data_statis = pd.DataFrame({
         'state_size': [state_size],
         'feature_dim': [feature_dim],

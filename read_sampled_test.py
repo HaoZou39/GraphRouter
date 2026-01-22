@@ -30,7 +30,7 @@ def read_sampled_test_head():
 
         print("前十行（按route_id和step_id排序）:")
         # 设置 pandas 显示选项，不省略中间的列
-        with pd.option_context('display.max_columns', None):
+        with pd.option_context('display.max_columns', None, 'display.max_colwidth', None):
             print(df.head(30))
 
         print("\n" + "=" * 80)
