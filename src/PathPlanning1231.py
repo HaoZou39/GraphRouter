@@ -2013,6 +2013,8 @@ def parse_args():
                         help='Number of max epochs.')
     parser.add_argument('--data', nargs='?', default='../data',
                         help='data directory')
+    parser.add_argument('--graph_id', type=str, default='default_graph',
+                        help='Graph identifier for multi-map support (default: default_graph)')
     # MOE (Mixture of Experts) support
     parser.add_argument('--user_id', type=str, default=None,
                         help='User ID for MOE training (e.g., user_001). If None, use standard single-user training.')
@@ -2058,8 +2060,6 @@ def parse_args():
     # Training phase parameters - 两阶段训练策略
     parser.add_argument('--phase1_epochs', type=int, default=10,  # 第一阶段：纯SL训练的epoch数
                         help='Number of epochs for Phase 1: SL-only training.')
-    parser.add_argument('--phase2_sl_rl_joint_steps', type=int, default=400000,  # 第二阶段：SL+RL联合训练
-                        help='Number of steps for Phase 2: SL+RL joint training.')
     parser.add_argument('--rl_weight_phase2', type=float, default=0.16,  # 🔥 急救：大幅降低RL权重
                         help='RL weight for Phase 2 (default: 0.08, emergency cooldown from 0.3 for stability).')
     parser.add_argument('--actor_rl_weight', type=float, default=0.1,  # Actor RL辅损权重
@@ -4023,10 +4023,13 @@ def rollout_with_candidates(sess, model, start_node_id, goal_node_id, graph_cach
         )
 
         # 构建候选边特征矩阵
+        # 注意：评估时没有episode context，使用默认值
+        d_start = graph_cache.get_dist_to_goal(start_node_id, goal_node_id)
         cand_features = feature_builder.build_candidate_features(
             cand_edge_ids=cand_edge_ids,
             cur_node_id=current_node_id,
             goal_node_id=goal_node_id,
+            d_start=d_start,
             prev_node_id=path[-2] if len(path) >= 2 else None,
             recent_visited_nodes=recent_nodes[-5:] if recent_nodes else None  # 最近5步
         )
@@ -5873,7 +5876,7 @@ def build_path_data_for_batch(group, state_size=10, edge_id_map=None):
     
     return path_states, path_actions, path_len_states, len(path_actions), path_user_ids
 
-def preload_all_datasets(data_directory='../data', user_id=None, moe_data_dir='examples/moe_data/processed', edge_id_map=None, state_size=10):
+def preload_all_datasets(data_directory='../data', user_id=None, moe_data_dir='examples/moe_data/processed', edge_id_map=None, state_size=10, graph_id='default_graph'):
     """
     预加载所有数据集并缓存，用于提升后续评估性能
     
@@ -5883,15 +5886,17 @@ def preload_all_datasets(data_directory='../data', user_id=None, moe_data_dir='e
         moe_data_dir: MOE data root directory (default: 'examples/moe_data/processed')
         edge_id_map: Edge ID mapping (optional)
         state_size: State size (history length, default: 10)
+        graph_id: Graph identifier (default: 'default_graph')
     """
     print("Preloading all datasets for caching...")
     
     # 如果没有提供edge_id_map，尝试加载
     if edge_id_map is None:
         try:
-            data = load_map_data(data_directory)
+            raw_data_dir = os.path.join(data_directory, 'graph_data', graph_id, 'raw_data')
+            data = load_map_data(raw_data_dir)
             df, meta_data = data["df"], data["meta_data"]
-            G, edge_id_map, edge_feature_list = load_or_create_graph(df.copy(), data_directory)
+            G, edge_id_map, edge_feature_list = load_or_create_graph(df.copy(), data_directory, graph_id)
         except Exception as e:
             print(f"⚠️  Warning: Could not load edge_id_map: {e}")
             edge_id_map = None
@@ -6729,16 +6734,17 @@ def collect_onpolicy_transitions(sess, model, replay_buffer, G, edge_id_map, ite
     
     return transitions
 
-def get_moe_data_path(data_directory, user_id, moe_data_dir, filename):
+def get_moe_data_path(data_directory, user_id, moe_data_dir, filename, graph_id='default_graph'):
     """
     获取MOE数据文件路径（如果指定了user_id）或标准路径
-    
+
     Args:
         data_directory: 标准数据目录（用于地图、图数据等）
         user_id: 用户ID（如果为None，使用标准路径）
         moe_data_dir: MOE数据根目录
         filename: 文件名（如 'replay_buffer.df'）
-    
+        graph_id: 图ID（默认为 'default_graph'）
+
     Returns:
         完整文件路径
     """
@@ -6756,7 +6762,11 @@ def get_moe_data_path(data_directory, user_id, moe_data_dir, filename):
         return os.path.join(user_data_dir, user_filename)
     else:
         # 标准模式：使用原有路径
-        return os.path.join(data_directory, filename)
+        # 对于训练数据文件（.df），replay_buffer.py 将其保存到图特定的 trajectories 目录
+        if filename.endswith('.df') and filename in ['data_statis.df', 'replay_buffer.df']:
+            return os.path.join(data_directory, 'graph_data', graph_id, 'trajectories', filename)
+        else:
+            return os.path.join(data_directory, filename)
 
 def get_stage1_model_path(data_directory, user_id, step, timestamp=None):
     """
@@ -6932,7 +6942,7 @@ if __name__ == '__main__':
     tf.compat.v1.set_random_seed(args.seed_phase2)
 
     # 加载数据统计文件（支持MOE）
-    data_statis_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'data_statis.df')
+    data_statis_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'data_statis.df', args.graph_id)
     if not os.path.exists(data_statis_path):
         raise FileNotFoundError(f"Data statistics file not found: {data_statis_path}")
     data_statis = pd.read_pickle(data_statis_path)
@@ -7056,11 +7066,13 @@ if __name__ == '__main__':
 
     tf.compat.v1.reset_default_graph()
 
-    data = load_map_data(data_directory)
+    # Load map data from graph-specific raw_data directory
+    raw_data_dir = os.path.join(data_directory, 'graph_data', args.graph_id, 'raw_data')
+    data = load_map_data(raw_data_dir)
     df, meta_data = data["df"], data["meta_data"]
     df_copy = deepcopy(df)
 
-    G, edge_id_map, edge_feature_list = load_or_create_graph(df_copy, data_directory)
+    G, edge_id_map, edge_feature_list = load_or_create_graph(df_copy, data_directory, args.graph_id)
 
     item_num = G.number_of_edges()
 
@@ -7098,7 +7110,7 @@ if __name__ == '__main__':
         print(f"🎯 Starting from global_step={global_step} (fresh training)")
 
     # 加载replay buffer（支持MOE）
-    replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df')
+    replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df', args.graph_id)
     if not os.path.exists(replay_buffer_path):
         raise FileNotFoundError(f"Replay buffer file not found: {replay_buffer_path}")
     replay_buffer = pd.read_pickle(replay_buffer_path)
@@ -7129,7 +7141,7 @@ if __name__ == '__main__':
 
     # Preload datasets if requested
     if args.preload_datasets:
-        preload_all_datasets(data_directory, args.user_id, args.moe_data_dir)
+        preload_all_datasets(data_directory, args.user_id, args.moe_data_dir, graph_id=args.graph_id)
 
     # If resume_ckpt is provided, try to load and set global_step
     resume_ckpt = args.resume_ckpt
@@ -7635,7 +7647,7 @@ if __name__ == '__main__':
                             print(f"   📊 Using provided replay_buffer ({len(train_replay_buffer)} transitions)")
                         else:
                             # 从文件读取（兼容旧代码）
-                            train_replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df')
+                            train_replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df', args.graph_id)
                             if os.path.exists(train_replay_buffer_path):
                                 train_replay_buffer = pd.read_pickle(train_replay_buffer_path)
                                 print(f"   📊 Loaded replay_buffer from file ({len(train_replay_buffer)} transitions)")
@@ -8321,16 +8333,26 @@ if __name__ == '__main__':
                         cur_node_id = cur_node_ids_batch[b]
                         goal_node_id = goal_node_ids_batch[b]
 
+                        # 获取d_start用于归一化
+                        d_start = batch['d_start'][b] if 'd_start' in batch else 100.0  # 默认值
+
+                        # 获取历史信息用于方向计算
+                        prev_node_id = batch.get('prev_node_id', [None]*len(cand_edge_ids_batch))[b]
+                        recent_visited = batch.get('recent_visited_nodes', [None]*len(cand_edge_ids_batch))[b]
+
                         # TODO: 根据graph_id选择对应的GraphCache和FeatureBuilder
                         # 目前所有数据都来自同一个图，所以使用同一个cache
                         current_cache = graph_cache
                         current_builder = feature_builder
 
-                        # 重建候选边特征
+                        # 重建候选边特征（传入d_start和历史信息）
                         cand_features = current_builder.build_candidate_features(
                             cand_edge_ids=cand_edge_ids,
                             cur_node_id=cur_node_id,
-                            goal_node_id=goal_node_id
+                            goal_node_id=goal_node_id,
+                            d_start=d_start,
+                            prev_node_id=prev_node_id,
+                            recent_visited_nodes=recent_visited
                         )
 
                         # 填充到固定大小 [max_candidates, feature_dim]

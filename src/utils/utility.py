@@ -9,6 +9,7 @@ import os
 import pandas as pd
 import geopandas as gpd
 import json
+import pickle
 from typing import Dict, Any, Tuple
 
 
@@ -65,25 +66,46 @@ def load_or_create_graph(df: gpd.GeoDataFrame, data_directory: str, graph_id: st
 
     # Create cache directory path
     cache_dir = os.path.join(data_directory, 'graph_data', graph_id, 'cache')
+    cache_file = os.path.join(cache_dir, 'graph_cache.pkl')
 
     # Try to load existing cache
     try:
-        graph_cache = GraphCache.load_from_file(cache_dir)
-        print(f"Loaded existing graph cache from {cache_dir}")
+        if not os.path.exists(cache_file):
+            raise FileNotFoundError(f"Graph cache file not found: {cache_file}")
+
+        # Load GraphCache
+        graph_cache = GraphCache()
+        graph_cache.load_from_file(cache_file)
+        print(f"Loaded existing graph cache from {cache_file}")
 
         # Rebuild the NetworkX graph
         graph_cache.rebuild_graph()
         G = graph_cache.G
 
-        # Get edge mappings (this might need to be implemented in GraphCache)
-        edge_id_map = getattr(graph_cache, 'edge_id_map', {})
-        edge_feature_list = getattr(graph_cache, 'edge_feature_list', [])
+        # Load edge_id_map and edge_feature_list from separate cache files
+        edge_id_map_file = os.path.join(cache_dir, 'edge_id_map.pkl')
+        edge_feature_list_file = os.path.join(cache_dir, 'edge_feature_list.pkl')
+
+        if os.path.exists(edge_id_map_file):
+            with open(edge_id_map_file, 'rb') as f:
+                edge_id_map = pickle.load(f)
+        else:
+            edge_id_map = {}
+            print(f"Warning: edge_id_map.pkl not found at {edge_id_map_file}")
+
+        if os.path.exists(edge_feature_list_file):
+            with open(edge_feature_list_file, 'rb') as f:
+                edge_feature_list = pickle.load(f)
+        else:
+            edge_feature_list = []
+            print(f"Warning: edge_feature_list.pkl not found at {edge_feature_list_file}")
 
         return G, edge_id_map, edge_feature_list
 
-    except FileNotFoundError:
-        print(f"No existing cache found at {cache_dir}, this should not happen for preprocess.py")
-        print("Please ensure generate_routes.py has been run first to create the cache.")
+    except FileNotFoundError as e:
+        print(f"No existing cache found: {e}")
+        print("Please ensure the graph cache has been built first.")
+        print(f"Run: python src/build_graph_cache.py --graph-id {graph_id} --data-dir {data_directory}")
         raise
 
     except Exception as e:

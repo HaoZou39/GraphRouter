@@ -86,6 +86,7 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
         'd_cur': [],   # Current distance to goal
         'd_next': [],  # Next distance to goal
         'delta_d': [], # Distance improvement
+        'd_start': [], # Episode initial distance (for normalization)
     }
 
     # Group by route_id to process each trajectory
@@ -94,9 +95,18 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
     for route_id, trajectory in route_groups:
         trajectory = trajectory.sort_values('step_id').reset_index(drop=True)
 
+        # Calculate d_start (episode initial distance)
+        start_node_id = trajectory.iloc[0]['start_node_id']
+        goal_node_id = trajectory.iloc[0]['goal_node_id']
+        d_start = graph_cache.get_dist_to_goal(start_node_id, goal_node_id)
+
         # Initialize history tracking
         history_edge_ids = []
         current_node_id = trajectory.iloc[0]['start_node_id']
+
+        # Track recent visited nodes and previous node
+        recent_visited = []  # 滚动窗口，保留最近5个节点
+        prev_node_id = None
 
         # Get graph_id from trajectory (assume all rows in trajectory have same graph_id)
         graph_id = trajectory.iloc[0].get('graph_id', 'default_graph')
@@ -108,11 +118,12 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
             next_node_id = row['next_node_id']
             dist_to_goal = row['dist_to_goal']
 
-            # Build current state (with history)
+            # Build current state (with d_start)
             state_features = feature_builder.build_state_features(
                 cur_node_id=cur_node_id,
                 goal_node_id=goal_node_id,
-                history_edge_ids=history_edge_ids[-history_length:] if history_edge_ids else []
+                start_node_id=start_node_id,
+                d_start=d_start
             )
 
             # Get candidate edges for current node (for E-bucket BC training)
@@ -128,7 +139,8 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
             next_state_features = feature_builder.build_state_features(
                 cur_node_id=next_node_id,
                 goal_node_id=goal_node_id,
-                history_edge_ids=next_history[-history_length:]
+                start_node_id=start_node_id,
+                d_start=d_start
             )
 
             # Calculate distances
@@ -162,10 +174,17 @@ def build_transition_from_trajectory_v2(group: pd.DataFrame, graph_cache: GraphC
             transitions['d_cur'].append(dist_to_goal)
             transitions['d_next'].append(next_dist_to_goal)
             transitions['delta_d'].append(delta_d)
+            transitions['d_start'].append(d_start)
 
             # Update history for next step
             history_edge_ids = next_history
             current_node_id = next_node_id
+
+            # Update recent visited and prev_node
+            recent_visited.append(cur_node_id)
+            if len(recent_visited) > 5:
+                recent_visited.pop(0)
+            prev_node_id = cur_node_id
 
     return transitions
 
@@ -192,7 +211,7 @@ def main(argv):
     try:
         graph_cache = multi_cache.get_cache(graph_id)
         feature_builder = multi_cache.get_feature_builder(graph_id)
-        print(f"✅ Loaded GraphCache and FeatureBuilder for graph '{graph_id}'")
+        print(f"SUCCESS: Loaded GraphCache and FeatureBuilder for graph '{graph_id}'")
         print(f"   Nodes: {graph_cache.get_node_count()}, Edges: {graph_cache.get_edge_count()}")
         print(f"   State feature dim: {feature_builder._get_feature_dim()}")
     except FileNotFoundError:
@@ -204,10 +223,10 @@ def main(argv):
         raise FileNotFoundError(f"Trajectory data not found: {train_sessions_path}. Run preprocess_v2.py first.")
 
     train_sessions = pd.read_pickle(train_sessions_path)
-    print(f"✅ Loaded trajectory data: {train_sessions.shape}")
+    print(f"SUCCESS: Loaded trajectory data: {train_sessions.shape}")
 
     # Build transitions
-    print("🔄 Building transitions...")
+    print("Building transitions...")
     transitions = build_transition_from_trajectory_v2(
         train_sessions, graph_cache, feature_builder, length, max_candidates
     )
@@ -215,7 +234,7 @@ def main(argv):
     # Convert to DataFrame
     replay_buffer = pd.DataFrame(transitions)
 
-    print(f"✅ Built replay buffer with {len(replay_buffer)} transitions")
+    print(f"SUCCESS: Built replay buffer with {len(replay_buffer)} transitions")
     print(f"   E-bucket transitions (with bc_action_idx): {replay_buffer['bc_action_idx'].notna().sum()}")
     print(f"   State shape: {replay_buffer['state'].iloc[0].shape if len(replay_buffer) > 0 else 'N/A'}")
 
@@ -234,8 +253,8 @@ def main(argv):
     })
     to_pickled_df(trajectories_dir, data_statis=data_statis)
 
-    print(f"✅ Saved replay buffer to {os.path.join(trajectories_dir, 'replay_buffer.df')}")
-    print(f"✅ Saved data statistics to {os.path.join(trajectories_dir, 'data_statis.df')}")
+    print(f"SUCCESS: Saved replay buffer to {os.path.join(trajectories_dir, 'replay_buffer.df')}")
+    print(f"SUCCESS: Saved data statistics to {os.path.join(trajectories_dir, 'data_statis.df')}")
 
 
 if __name__ == '__main__':

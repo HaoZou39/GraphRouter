@@ -14,7 +14,6 @@ import os
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 import json
 from shapely import wkt
 from utils.utility import *
@@ -173,11 +172,18 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
 
     # Check if this is a loop route (start == goal)
     is_loop = (start_node_id == goal_node_id)
-    
+
+    # Calculate d_start (episode initial distance for normalization)
+    d_start = graph_cache.get_dist_to_goal(start_node_id, goal_node_id)
+
     # Process trajectory by following edges in GPKG order
     trajectory_rows = []
     cur_node_id = start_node_id
     step_counter = 0
+
+    # Initialize history tracking
+    recent_visited = []  # 滚动窗口，保留最近5个节点
+    prev_node_id = None
     
     for df_idx, row in gdf.iterrows():
         geom = row['geometry']
@@ -235,6 +241,9 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
             'action_edge_id': edge_id,
             'next_node_id': next_node_id,
             'dist_to_goal': dist_to_goal,
+            'd_start': d_start,
+            'prev_node_id': prev_node_id,
+            'recent_visited_nodes': recent_visited.copy(),
         }
         trajectory_rows.append(trajectory_row)
         
@@ -242,6 +251,12 @@ def process_gpkg_from_graph(file_path, route_id, meta_data, data_directory, grap
         if next_node_id == goal_node_id:
             break
         
+        # Update history tracking
+        recent_visited.append(cur_node_id)
+        if len(recent_visited) > 5:
+            recent_visited.pop(0)
+        prev_node_id = cur_node_id
+
         # Move to next node
         cur_node_id = next_node_id
         step_counter += 1

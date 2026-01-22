@@ -34,175 +34,169 @@ class FeatureBuilder:
             graph_cache: GraphCache instance with map data
         """
         self.graph_cache = graph_cache
+        # Path type embedding: 3 types → 3 dim (简单lookup)
+        self.path_type_embeddings = np.array([
+            [1.0, 0.0, 0.0],  # walk
+            [0.0, 1.0, 0.0],  # bike
+            [0.0, 0.0, 1.0],  # connection
+        ], dtype=np.float32)
+
+    def _embed_path_type(self, path_type: int) -> np.ndarray:
+        """将 path_type ∈ {0,1,2} 映射到 3维 embedding"""
+        return self.path_type_embeddings[int(path_type)]
 
     def build_candidate_features(self,
                                 cand_edge_ids: List[int],
                                 cur_node_id: int,
                                 goal_node_id: int,
+                                d_start: float,
                                 prev_node_id: Optional[int] = None,
                                 recent_visited_nodes: Optional[List[int]] = None) -> np.ndarray:
         """
-        Build candidate edge features matrix.
-
-        MVP features (strictly enforced):
-        - edge_attr: length_norm, width, curb_norm, crossing, path_type
-        - progress: d_cur, d_next_i, delta_d_i, rank_delta_d_i
-        - local: out_degree, backtrack_flag_i, loop_recent_flag_i
+        Build candidate features: [K, 10维]
 
         Args:
-            cand_edge_ids: List of candidate edge IDs
-            cur_node_id: Current node ID
-            goal_node_id: Goal node ID
-            prev_node_id: Previous node ID (for backtrack detection)
-            recent_visited_nodes: Recently visited node IDs (for loop detection)
-
-        Returns:
-            [K, Dc] feature matrix where K=len(cand_edge_ids)
+            d_start: Episode初始距离（用于归一化）
         """
         if not cand_edge_ids:
-            return np.array([]).reshape(0, self._get_feature_dim())
+            return np.array([]).reshape(0, 10)
 
-        K = len(cand_edge_ids)
         features = []
-
-        # Pre-compute common values
         d_cur = self.graph_cache.get_dist_to_goal(cur_node_id, goal_node_id)
-        out_degree = self.graph_cache.get_node_attr(cur_node_id).get('out_degree', 0)
 
-        # Get distances to goal for all candidate target nodes
-        cand_distances = []
+        # 获取坐标（用于方向计算）
+        cur_coord = self.graph_cache.node_coords[cur_node_id]
+        goal_coord = self.graph_cache.node_coords[goal_node_id]
+
+        # 计算参考方向
+        if prev_node_id is not None:
+            prev_coord = self.graph_cache.node_coords[prev_node_id]
+            ref_vec = np.array([cur_coord[0] - prev_coord[0],
+                               cur_coord[1] - prev_coord[1]])
+        else:
+            ref_vec = np.array([goal_coord[0] - cur_coord[0],
+                               goal_coord[1] - cur_coord[1]])
+        ref_norm = np.linalg.norm(ref_vec)
+
         for edge_id in cand_edge_ids:
-            u_id, v_id = self.graph_cache.get_edge_nodes(edge_id)
-            d_next = self.graph_cache.get_dist_to_goal(v_id, goal_node_id)
-            cand_distances.append(d_next)
-
-        # Compute rank of delta_d among candidates
-        delta_ds = [d - d_cur for d in cand_distances]
-        ranks = np.argsort(np.argsort(delta_ds))  # rank from 0 to K-1
-
-        for i, edge_id in enumerate(cand_edge_ids):
-            # Get edge attributes
             edge_attr = self.graph_cache.get_edge_attr(edge_id)
+            u_id, v_id = self.graph_cache.get_edge_nodes(edge_id)
+            next_coord = self.graph_cache.node_coords[v_id]
+
+            # 边属性
             length_norm = edge_attr.get('length_norm', 0)
             width = edge_attr.get('width', 0)
             curb_norm = edge_attr.get('curb_norm', 0)
-            crossing = edge_attr.get('crossing', 0)
-            path_type = edge_attr.get('path_type', 0)
+            crossing = float(edge_attr.get('crossing', 0))
+            path_type = int(edge_attr.get('path_type', 0))
+            path_type_emb = self._embed_path_type(path_type)
 
-            # Progress features
-            d_next = cand_distances[i]
-            delta_d = delta_ds[i]
-            rank_delta_d = ranks[i]
+            # 相对方向
+            edge_vec = np.array([next_coord[0] - cur_coord[0],
+                                next_coord[1] - cur_coord[1]])
+            edge_norm = np.linalg.norm(edge_vec)
 
-            # Local features
-            backtrack_flag = 0
-            if prev_node_id is not None:
-                u_id, v_id = self.graph_cache.get_edge_nodes(edge_id)
-                backtrack_flag = 1 if v_id == prev_node_id else 0
+            if ref_norm > 1e-6 and edge_norm > 1e-6:
+                cos_rel = np.dot(ref_vec, edge_vec) / (ref_norm * edge_norm)
+                sin_rel = (ref_vec[0] * edge_vec[1] - ref_vec[1] * edge_vec[0]) / (ref_norm * edge_norm)
+            else:
+                cos_rel, sin_rel = 0.0, 0.0
 
-            loop_recent_flag = 0
-            if recent_visited_nodes:
-                u_id, v_id = self.graph_cache.get_edge_nodes(edge_id)
-                loop_recent_flag = 1 if v_id in recent_visited_nodes else 0
+            # 进度
+            d_next = self.graph_cache.get_dist_to_goal(v_id, goal_node_id)
+            delta_frac = (d_next - d_cur) / d_start if d_start > 0 else 0.0
 
-            # Build feature vector
-            feature_vec = [
-                # Edge attributes
-                length_norm, width, curb_norm, crossing, path_type,
-                # Progress
-                d_cur, d_next, delta_d, rank_delta_d,
-                # Local
-                out_degree, backtrack_flag, loop_recent_flag
-            ]
+            # 约束
+            backtrack_flag = 1.0 if (prev_node_id is not None and v_id == prev_node_id) else 0.0
+            loop_flag = 1.0 if (recent_visited_nodes and v_id in recent_visited_nodes) else 0.0
 
+            feature_vec = np.concatenate([
+                [length_norm, width, curb_norm, crossing],
+                path_type_emb,
+                [cos_rel, sin_rel, delta_frac, backtrack_flag, loop_flag]
+            ])
             features.append(feature_vec)
 
         return np.array(features, dtype=np.float32)
 
     def build_history_token(self,
                            chosen_edge_id: int,
-                           transition_context: Optional[Dict[str, Any]] = None) -> np.ndarray:
+                           prev_node_id: Optional[int] = None,
+                           recent_visited_nodes: Optional[List[int]] = None) -> np.ndarray:
         """
-        Build history token for sequence modeling.
+        Build history token: [7维]
 
-        MVP implementation: Use edge attributes as history token.
-        Can be extended to include transition context.
+        包含：边属性(5) + 记忆标记(2)
 
         Args:
             chosen_edge_id: ID of the chosen edge
-            transition_context: Optional context about the transition
-
-        Returns:
-            [Dh] history token vector
+            prev_node_id: Previous node ID (for backtrack detection)
+            recent_visited_nodes: Recently visited nodes (for loop detection)
         """
         edge_attr = self.graph_cache.get_edge_attr(chosen_edge_id)
+        u_id, v_id = self.graph_cache.get_edge_nodes(chosen_edge_id)
 
-        # Basic implementation: use edge attributes
-        token = [
-            edge_attr.get('length_norm', 0),
-            edge_attr.get('width', 0),
-            edge_attr.get('curb_norm', 0),
-            edge_attr.get('crossing', 0),
-            edge_attr.get('path_type', 0)
-        ]
+        # 边属性
+        length_norm = edge_attr.get('length_norm', 0)
+        width = edge_attr.get('width', 0)
+        curb_norm = edge_attr.get('curb_norm', 0)
+        crossing = float(edge_attr.get('crossing', 0))
+        path_type = int(edge_attr.get('path_type', 0))
+        path_type_emb = self._embed_path_type(path_type)  # [3]
 
-        # Optional: add transition context (reward, success, etc.)
-        if transition_context:
-            # Could add normalized reward, success flag, etc.
-            pass
+        # 记忆标记
+        backtrack_flag = 0.0
+        if prev_node_id is not None:
+            backtrack_flag = 1.0 if v_id == prev_node_id else 0.0
 
-        return np.array(token, dtype=np.float32)
+        visited_recent_flag = 0.0
+        if recent_visited_nodes:
+            visited_recent_flag = 1.0 if v_id in recent_visited_nodes else 0.0
+
+        token = np.concatenate([
+            [length_norm, width, curb_norm, crossing],
+            path_type_emb,
+            [backtrack_flag, visited_recent_flag]
+        ])
+
+        return token.astype(np.float32)
 
     def build_state_features(self,
-                           cur_node_id: int,
-                           goal_node_id: int,
-                           history_edge_ids: Optional[List[int]] = None) -> np.ndarray:
+                            cur_node_id: int,
+                            goal_node_id: int,
+                            start_node_id: int,
+                            d_start: float) -> np.ndarray:
         """
-        Build global state features for sequence encoder input.
-
-        MVP implementation: Basic node and goal information.
+        Build global state: [2维]
 
         Args:
-            cur_node_id: Current node ID
-            goal_node_id: Goal node ID
-            history_edge_ids: Recent edge IDs in history
-
-        Returns:
-            [Ds] state feature vector
+            d_start: Episode初始距离（用于归一化）
         """
-        # Node attributes
         node_attr = self.graph_cache.get_node_attr(cur_node_id)
-        out_degree = node_attr.get('out_degree', 0)
+        out_degree = float(node_attr.get('out_degree', 0))
 
-        # Progress to goal
-        dist_to_goal = self.graph_cache.get_dist_to_goal(cur_node_id, goal_node_id)
+        d_cur = self.graph_cache.get_dist_to_goal(cur_node_id, goal_node_id)
+        dist_frac = d_cur / d_start if d_start > 0 else 0.0
 
-        # History statistics (optional)
-        avg_edge_length = 0
-        if history_edge_ids:
-            edge_lengths = []
-            for edge_id in history_edge_ids[-5:]:  # Last 5 edges
-                edge_attr = self.graph_cache.get_edge_attr(edge_id)
-                edge_lengths.append(edge_attr.get('length_norm', 0))
-            if edge_lengths:
-                avg_edge_length = np.mean(edge_lengths)
+        return np.array([out_degree, dist_frac], dtype=np.float32)
 
-        state_features = [
-            out_degree,
-            dist_to_goal,
-            avg_edge_length
-        ]
+    def _get_history_dim(self) -> int:
+        """History token维度"""
+        return 9  # 4 + 3(path_type_emb) + 2(memory)
 
-        return np.array(state_features, dtype=np.float32)
+    def _get_global_dim(self) -> int:
+        """Global state维度"""
+        return 2
+
+    def _get_candidate_dim(self) -> int:
+        """Candidate feature维度"""
+        return 12  # 4 + 3(path_type_emb) + 2(direction) + 1(progress) + 2(constraints)
 
     def _get_feature_dim(self) -> int:
         """
-        Get candidate feature dimension.
-
-        Hard-coded based on MVP feature specification.
+        Get candidate feature dimension (backward compatibility).
         """
-        # edge_attr: 5, progress: 4, local: 3 = 12 total
-        return 5 + 4 + 3
+        return self._get_candidate_dim()
 
     def pad_candidate_features(self,
                              features: np.ndarray,

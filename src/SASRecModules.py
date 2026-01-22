@@ -10,6 +10,35 @@ from __future__ import print_function
 import tensorflow as tf
 import numpy as np
 
+def normalize(inputs, 
+              epsilon = 1e-8,
+              scope="ln",
+              reuse=None):
+    '''Applies layer normalization.
+    
+    Args:
+      inputs: A tensor with 2 or more dimensions, where the first dimension has
+        `batch_size`.
+      epsilon: A floating number. A very small number for preventing ZeroDivision Error.
+      scope: Optional scope for `variable_scope`.
+      reuse: Boolean, whether to reuse the weights of a previous layer
+        by the same name.
+      
+    Returns:
+      A tensor with the same shape and data dtype as `inputs`.
+    '''
+    with tf.compat.v1.variable_scope(scope, reuse=reuse):
+        inputs_shape = inputs.get_shape()
+        params_shape = inputs_shape[-1:]
+    
+        mean, variance = tf.nn.moments(inputs, [-1], keepdims=True)
+        beta= tf.Variable(tf.zeros(params_shape))
+        gamma = tf.Variable(tf.ones(params_shape))
+        normalized = (inputs - mean) / ( (variance + epsilon) ** (.5) )
+        outputs = gamma * normalized + beta
+        
+    return outputs
+
 def positional_encoding(dim, sentence_length, dtype=tf.float32):
 
     encoded_vec = np.array([pos/np.power(10000, 2*i/dim) for pos in range(sentence_length) for i in range(dim)])
@@ -196,52 +225,69 @@ def multihead_attention(queries,
         outputs += queries
               
         # Normalize
-        #outputs = normalize(outputs) # (N, T_q, C)
+        outputs = normalize(outputs) # (N, T_q, C)
  
     if with_qk: return Q,K
     else: return outputs
 
 def feedforward(inputs, 
                 num_units=[2048, 512],
-                scope="multihead_attention", 
                 dropout_rate=0.2,
                 is_training=True,
-                reuse=None):
-    '''Point-wise feed forward net.
+                block_id=0):
+    '''Point-wise feed forward net using Keras layers only.
     
     Args:
       inputs: A 3d tensor with shape of [N, T, C].
       num_units: A list of two integers.
-      scope: Optional scope for `variable_scope`.
-      reuse: Boolean, whether to reuse the weights of a previous layer
-        by the same name.
+      dropout_rate: Dropout rate.
+      is_training: Training flag.
+      block_id: Block index to avoid variable name conflicts.
         
     Returns:
       A 3d tensor with the same shape and dtype as inputs
     '''
-    # with tf.compat.v1.variable_scope(scope, reuse=reuse):
-    # Inner layer
-    # params = {"inputs": inputs, "filters": num_units[0], "kernel_size": 1,
-    #           "activation": tf.nn.relu, "use_bias": True}
-    outputs = tf.keras.layers.Conv1D(filters=num_units[0], kernel_size=1, 
-                              activation='relu', use_bias=True)(inputs)
-    # outputs = tf.compat.v1.layers.conv1d(**params)
-    outputs = tf.keras.layers.Dropout(rate=dropout_rate)(outputs, training=is_training)
+    # Inner layer - Use Keras Dense layer
+    inner_output = tf.keras.layers.Dense(
+        units=num_units[0],
+        activation='relu',
+        name=f"ff_inner_{block_id}"
+    )(inputs)
+    # Dropout - TensorFlow 2.x compatible
+    inner_output = tf.cond(
+        is_training,
+        lambda: tf.nn.dropout(inner_output, rate=dropout_rate),
+        lambda: inner_output
+    )
 
-    # outputs = tf.compat.v1.layers.dropout(outputs, rate=dropout_rate, training=tf.convert_to_tensor(is_training))
-    # Readout layer
-    # params = {"inputs": outputs, "filters": num_units[1], "kernel_size": 1,
-    #           "activation": None, "use_bias": True}
-    outputs = tf.keras.layers.Conv1D(filters=num_units[1], kernel_size=1, 
-                                    activation=None, use_bias=True)(outputs)
-    # outputs = tf.compat.v1.layers.conv1d(**params)
-    outputs = tf.keras.layers.Dropout(rate=dropout_rate)(outputs, training=is_training)
-    # outputs = tf.compat.v1.layers.dropout(outputs, rate=dropout_rate, training=tf.convert_to_tensor(is_training))
+    # Readout layer - Use Keras Dense layer
+    outputs = tf.keras.layers.Dense(
+        units=num_units[1],
+        activation=None,
+        name=f"ff_readout_{block_id}"
+    )(inner_output)
+    # Dropout - TensorFlow 2.x compatible
+    outputs = tf.cond(
+        is_training,
+        lambda: tf.nn.dropout(outputs, rate=dropout_rate),
+        lambda: outputs
+    )
     
     # Residual connection
     outputs += inputs
     
-    # Normalize
-    #outputs = normalize(outputs)
-    
     return outputs
+
+def extract_axis_1(data, ind):
+    """
+    Get specified elements along the first axis of tensor.
+    :param data: Tensorflow tensor that will be subsetted.
+    :param ind: Indices to take (one for each element along axis 0 of data).
+    :return: Subsetted tensor.
+    """
+
+    batch_range = tf.range(tf.shape(data)[0])
+    indices = tf.stack([batch_range, ind], axis=1)
+    res = tf.gather_nd(data, indices)
+
+    return res
