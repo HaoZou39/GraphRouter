@@ -4,6 +4,7 @@ Path Planning functions for the Graph Routing project.
 This module contains path planning functions for the Graph Routing project.
 """
 import numpy as np
+import os
 
 def create_action_feature(
     new_pos, origin_x, origin_y, dest_x, dest_y, static_feature, target_edge,
@@ -1478,35 +1479,101 @@ def precollect_obuffer_at_phase2_transition(sess, model, onpolicy_buffer, data_d
             start_end_pairs_with_user = []
             seen_pairs = set()
             for _, row in train_replay_buffer.iterrows():
-                action = row['action']
-                if isinstance(action, (list, np.ndarray)) and len(action) >= 15:
-                    start_x, start_y = float(action[9]), float(action[10])
-                    end_x, end_y = float(action[11]), float(action[12])
-                    # 检查replay_buffer中是否有user_id列
-                    if 'user_id' in row:
-                        # 🔥 转换整数user_id为字符串格式
-                        pair_user_id = normalize_user_id(row['user_id'])
+                # 支持新旧两种数据格式
+                if 'taken_edge_id' in row and 'cur_node_id' in row and 'goal_node_id' in row:
+                    # 新格式：使用node_id
+                    start_node_id = int(row['cur_node_id'])
+                    end_node_id = int(row['goal_node_id'])
+                    # 调试：打印一些样本数据
+                    if len(start_end_pairs_with_user) < 3:  # 只打印前几个
+                        print(f"   🔍 Sample data: cur_node_id={start_node_id}, goal_node_id={end_node_id}")
+                    # 将node_id转换为坐标（如果有edge_id_map）
+                    if edge_id_map is not None and G is not None:
+                        try:
+                            start_pos = (G.nodes[start_node_id]['x'], G.nodes[start_node_id]['y'])
+                            end_pos = (G.nodes[end_node_id]['x'], G.nodes[end_node_id]['y'])
+                            start_x, start_y = start_pos
+                            end_x, end_y = end_pos
+                            if len(start_end_pairs_with_user) < 3:  # 只打印前几个
+                                print(f"   ✅ Coordinates: ({start_x:.2f}, {start_y:.2f}) -> ({end_x:.2f}, {end_y:.2f})")
+                        except KeyError as e:
+                            # 调试：打印错误信息
+                            print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: {e}")
+                            if len(start_end_pairs_with_user) < 1:  # 只打印一次
+                                print(f"   Available nodes: {list(G.nodes())[:10]}...")  # 只显示前10个
+                            continue  # 跳过无效的node_id
                     else:
-                        # 如果没有user_id列，使用传入的user_id参数
-                        pair_user_id = normalize_user_id(user_id) if user_id is not None else 'user_001'
-                    
-                    pair_key = (start_x, start_y, end_x, end_y, pair_user_id)
-                    if pair_key not in seen_pairs:
-                        start_end_pairs_with_user.append(((start_x, start_y), (end_x, end_y), pair_user_id))
-                        seen_pairs.add(pair_key)
-            
+                        print(f"   ⚠️  Missing graph data (edge_id_map or G is None)")
+                        continue  # 如果没有图数据，跳过
+                elif 'action' in row:
+                    # 旧格式：从action数组提取坐标
+                    action = row['action']
+                    if isinstance(action, (list, np.ndarray)) and len(action) >= 15:
+                        start_x, start_y = float(action[9]), float(action[10])
+                        end_x, end_y = float(action[11]), float(action[12])
+                    else:
+                        continue  # 跳过无效格式
+                else:
+                    continue  # 跳过没有所需字段的行
+
+                # 检查replay_buffer中是否有user_id列
+                if 'user_id' in row:
+                    # 🔥 转换整数user_id为字符串格式
+                    pair_user_id = normalize_user_id(row['user_id'])
+                else:
+                    # 如果没有user_id列，使用传入的user_id参数
+                    pair_user_id = normalize_user_id(user_id) if user_id is not None else 'user_001'
+
+                pair_key = (start_x, start_y, end_x, end_y, pair_user_id)
+                if pair_key not in seen_pairs:
+                    start_end_pairs_with_user.append(((start_x, start_y), (end_x, end_y), pair_user_id))
+                    seen_pairs.add(pair_key)
+
             start_end_pairs = start_end_pairs_with_user
             print(f"   ✅ Found {len(start_end_pairs)} unique start-end-user pairs")
         else:
             # 单用户模式：只保存 (start, end)
             start_end_pairs = set()
             for _, row in train_replay_buffer.iterrows():
-                action = row['action']
-                if isinstance(action, (list, np.ndarray)) and len(action) >= 15:
-                    start_x, start_y = float(action[9]), float(action[10])
-                    end_x, end_y = float(action[11]), float(action[12])
-                    start_end_pairs.add(((start_x, start_y), (end_x, end_y)))
-            
+                # 支持新旧两种数据格式
+                if 'taken_edge_id' in row and 'cur_node_id' in row and 'goal_node_id' in row:
+                    # 新格式：使用node_id
+                    start_node_id = int(row['cur_node_id'])
+                    end_node_id = int(row['goal_node_id'])
+                    # 调试：打印一些样本数据
+                    if len(start_end_pairs) < 3:  # 只打印前几个
+                        print(f"   🔍 Sample data: cur_node_id={start_node_id}, goal_node_id={end_node_id}")
+                    # 将node_id转换为坐标（如果有edge_id_map）
+                    if edge_id_map is not None and G is not None:
+                        try:
+                            start_pos = (G.nodes[start_node_id]['x'], G.nodes[start_node_id]['y'])
+                            end_pos = (G.nodes[end_node_id]['x'], G.nodes[end_node_id]['y'])
+                            start_x, start_y = start_pos
+                            end_x, end_y = end_pos
+                            start_end_pairs.add(((start_x, start_y), (end_x, end_y)))
+                            if len(start_end_pairs) <= 3:  # 只打印前几个
+                                print(f"   ✅ Coordinates: ({start_x:.2f}, {start_y:.2f}) -> ({end_x:.2f}, {end_y:.2f})")
+                        except KeyError as e:
+                            # 调试：打印错误信息
+                            print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: {e}")
+                            if len(start_end_pairs) < 1:  # 只打印一次
+                                print(f"   Available nodes: {list(G.nodes())[:10]}...")  # 只显示前10个
+                            continue  # 跳过无效的node_id
+                    else:
+                        print(f"   ⚠️  Missing graph data (edge_id_map or G is None)")
+                        continue  # 如果没有图数据，跳过
+                elif 'action' in row:
+                    # 旧格式：从action数组提取坐标
+                    action = row['action']
+                    if isinstance(action, (list, np.ndarray)) and len(action) >= 15:
+                        start_x, start_y = float(action[9]), float(action[10])
+                        end_x, end_y = float(action[11]), float(action[12])
+                        start_end_pairs.add(((start_x, start_y), (end_x, end_y)))
+                    else:
+                        continue  # 跳过无效格式
+                else:
+                    continue  # 跳过没有所需字段的行
+
             start_end_pairs = list(start_end_pairs)
             print(f"   ✅ Found {len(start_end_pairs)} unique start-end pairs")
         

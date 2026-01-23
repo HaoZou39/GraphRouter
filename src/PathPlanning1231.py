@@ -14,7 +14,7 @@ from utils.state_processing import *
 from SASRecModules import *
 from copy import deepcopy
 
-# 🔥 文本 Embedding 集成支持
+# Text Embedding Integration Support
 try:
     from text_embedding_loader import TextEmbeddingLoader
     from text_context_generator import discretize_goal_context
@@ -79,7 +79,7 @@ def parse_args():
     # Training phase parameters - 两阶段训练策略
     parser.add_argument('--phase1_epochs', type=int, default=10,  # 第一阶段：纯SL训练的epoch数
                         help='Number of epochs for Phase 1: SL-only training.')
-    parser.add_argument('--rl_weight_phase2', type=float, default=0.16,  # 🔥 急救：大幅降低RL权重
+    parser.add_argument('--rl_weight_phase2', type=float, default=0.16,  # Emergency: Significantly reduce RL weight
                         help='RL weight for Phase 2 (default: 0.08, emergency cooldown from 0.3 for stability).')
     parser.add_argument('--actor_rl_weight', type=float, default=0.1,  # Actor RL辅损权重
                         help='Actor RL auxiliary loss weight (λ_RL, default: 0.05 for Phase 2).')
@@ -137,6 +137,8 @@ def parse_args():
     # Training data sampling ratio
     parser.add_argument('--train_data_ratio', type=float, default=1.0,
                         help='Ratio of training data to use (0.1=10%%, 0.25=25%%, 0.5=50%%, 0.75=75%%, 1.0=100%%). Default: 1.0 (use all data).')
+    parser.add_argument('--use_eval_data_for_training', action='store_true',
+                        help='Use evaluation data (sampled_train.df) instead of replay_buffer.df for training. Ensures consistency with evaluation accuracy by using the same high-quality data.')
     
     # Two-Stage Training Configuration
     parser.add_argument('--stage1_save_model', action='store_true', default=True,
@@ -159,14 +161,14 @@ def parse_args():
     parser.add_argument('--eval_temperature', type=float, default=1.0,
                         help='Temperature for evaluation sampling. 0.0=greedy, 1.0=sample from distribution, >1.0=more random.')
     
-    # 🔥 Text Embedding Integration Parameters
+    # Text Embedding Integration Parameters
     parser.add_argument('--use_text_embeddings', action='store_true', default=False,
                         help='Enable text embeddings to enhance features (requires text_embedding_cache_dir).')
     parser.add_argument('--text_embedding_cache_dir', type=str, default='./data/text_embeddings_test',
                         help='Directory containing text embedding LMDB cache.')
     parser.add_argument('--embedding_proj_dim', type=int, default=64,
                         help='Projection dimension for text embeddings (default: 64).')
-    parser.add_argument('--use_edge_embedding', action='store_true', default=False,  # 🔥 临时禁用edge embedding以提升性能
+    parser.add_argument('--use_edge_embedding', action='store_true', default=False,  # Temporarily disable edge embedding for performance
                         help='Use edge text embeddings (requires --use_text_embeddings).')
     parser.add_argument('--use_node_embedding', action='store_true', default=True,
                         help='Use node text embeddings (requires --use_text_embeddings).')
@@ -179,10 +181,10 @@ def parse_args():
 def determine_training_phase(global_step, args, load_stage1_model=False):
     """确定当前训练阶段和相关参数"""
     
-    # 🔥 确保phase边界值是数字，避免tuple/float比较错误
+    # Ensure phase boundary values are numeric, avoid tuple/float comparison errors
     phase1_end = args.phase1_sl_only_steps
     
-    # 🔥 如果已经加载了Stage-1模型，直接进入Phase-2
+    # If Stage-1 model is already loaded, directly enter Phase-2
     if load_stage1_model:
         return 2, "Phase2-SL+RL-Joint", args.rl_weight_phase2, args.lr
 
@@ -209,7 +211,7 @@ def build_feed_dict(model, state, len_state, target_Qs, reward,
                    negative_actions=None, negative_rewards=None,
                    negative_target_Qs=None, negative_actor_target_probs=None, negative_loss_weight=0.0,
                    negative_loss_mask=None, actor_rl_weight=0.1, is_training=True,
-                   cand_features=None, cand_mask=None):
+                   cand_features=None, cand_mask=None, bc_action_idx=None, rl_action_cand_idx=None):
     """
     Build universal feed_dict
     
@@ -218,11 +220,11 @@ def build_feed_dict(model, state, len_state, target_Qs, reward,
         state, len_state, target_Qs, reward, discount, action_ids, target_Qs_selector, action_masks: 训练数据
         current_phase: 训练阶段
         rl_weight: RL权重
-        actor_target_probs: Actor target概率 π_tgt(a'|s') [batch_size, item_num] (🔥 Actor-Critic DDPG)
+        actor_target_probs: Actor target probabilities π_tgt(a'|s') [batch_size, item_num] (Actor-Critic DDPG)
         negative_actions: 负样本动作 [batch_size, num_neg]
         negative_rewards: 负样本奖励 [batch_size, num_neg]
         negative_target_Qs: 负样本target Q值 [batch_size, num_neg, item_num]
-        negative_actor_target_probs: 负样本Actor target概率 [batch_size, num_neg, item_num] (🔥 Actor-Critic DDPG)
+        negative_actor_target_probs: Negative sample Actor target probabilities [batch_size, num_neg, item_num] (Actor-Critic DDPG)
         negative_loss_weight: 负样本损失权重
         actor_rl_weight: Actor RL辅损权重 λ_RL
         is_training: 是否训练模式
@@ -243,53 +245,74 @@ def build_feed_dict(model, state, len_state, target_Qs, reward,
         model.is_training: is_training,
         model.training_phase: current_phase,
         model.rl_weight: rl_weight,
-        model.actor_rl_weight: actor_rl_weight,  # 🔥 Actor-Critic DDPG
+        model.actor_rl_weight: actor_rl_weight,  # Actor-Critic DDPG
         model.negative_loss_weight: negative_loss_weight,
     }
+
+    # New: Candidate edge action indices (for SL training, optional)
+    if bc_action_idx is not None and hasattr(model, 'bc_action_idx'):
+        feed_dict[model.bc_action_idx] = bc_action_idx
+    elif hasattr(model, 'bc_action_idx'):
+        # 如果没有提供bc_action_idx，但模型需要它，传递默认值
+        # 对于RL训练，bc_action_idx不重要，传递-1数组
+        batch_size = len(state) if state is not None else 1
+        feed_dict[model.bc_action_idx] = np.full(batch_size, -1, dtype=np.int32)
+
+    # New: Candidate edge action indices for RL training
+    if rl_action_cand_idx is not None and hasattr(model, 'rl_action_cand_idx'):
+        feed_dict[model.rl_action_cand_idx] = rl_action_cand_idx
+    elif hasattr(model, 'rl_action_cand_idx'):
+        # 如果没有提供rl_action_cand_idx，传递默认值-1
+        batch_size = len(state) if state is not None else 1
+        feed_dict[model.rl_action_cand_idx] = np.full(batch_size, -1, dtype=np.int32)
 
     # NEW: Add candidate-based training support
     if cand_features is not None and hasattr(model, 'cand_features'):
         feed_dict[model.cand_features] = cand_features
         feed_dict[model.cand_mask] = cand_mask if cand_mask is not None else np.ones_like(cand_features[:, :, 0])
     
-    # 🔥 Actor-Critic DDPG: Add actor_target_probs
+    #  Actor-Critic DDPG: Add actor_target_probs
     if actor_target_probs is not None:
         feed_dict[model.actor_target_probs] = actor_target_probs
     else:
         # Provide zero probs as placeholder
-        batch_size = len(state)
-        feed_dict[model.actor_target_probs] = np.zeros((batch_size, model.item_num), dtype=np.float32)
+        batch_size = len(state) if state is not None else 1
+        feed_dict[model.actor_target_probs] = np.zeros((batch_size, model.max_candidates), dtype=np.float32)
     
     # 添加负样本数据（如果提供）
     if negative_actions is not None and negative_rewards is not None and negative_target_Qs is not None:
         feed_dict[model.negative_actions] = negative_actions
         feed_dict[model.negative_rewards] = negative_rewards
         feed_dict[model.negative_target_Qs] = negative_target_Qs
-        # 🔥 Actor-Critic DDPG: Add negative_actor_target_probs
+        #  Actor-Critic DDPG: Add negative_actor_target_probs
         if negative_actor_target_probs is not None:
             feed_dict[model.negative_actor_target_probs] = negative_actor_target_probs
         else:
             # Provide zero probs as placeholder
             batch_size = negative_actions.shape[0] if len(negative_actions.shape) > 0 else 0
             num_neg = negative_actions.shape[1] if len(negative_actions.shape) > 1 else 0
-            feed_dict[model.negative_actor_target_probs] = np.zeros((batch_size, num_neg, model.item_num), dtype=np.float32)
+            feed_dict[model.negative_actor_target_probs] = np.zeros((batch_size, num_neg, model.max_candidates), dtype=np.float32)
         
-        # 🔥 添加损失掩码
+        #  添加损失掩码
         if negative_loss_mask is not None:
             feed_dict[model.negative_loss_mask] = negative_loss_mask
         else:
             # 如果没有提供掩码，创建全1掩码（向后兼容）
+            raise Exception('negative_loss_mask not found')
             batch_size = negative_actions.shape[0] if len(negative_actions.shape) > 0 else 0
             num_neg = negative_actions.shape[1] if len(negative_actions.shape) > 1 else 0
             feed_dict[model.negative_loss_mask] = np.ones((batch_size, num_neg), dtype=np.float32)
     else:
-        # 提供空的占位符
+        print("No negative samples provided")
+        #  修复：即使没有负样本，也提供正确形状的数组 (batch, self.neg)
+        # 使用填充值确保形状正确，避免shape=0导致的崩溃
         batch_size = len(state)
-        feed_dict[model.negative_actions] = np.zeros((batch_size, 0), dtype=np.int32)
-        feed_dict[model.negative_rewards] = np.zeros((batch_size, 0), dtype=np.float32)
-        feed_dict[model.negative_target_Qs] = np.zeros((batch_size, 0, model.item_num), dtype=np.float32)
-        feed_dict[model.negative_actor_target_probs] = np.zeros((batch_size, 0, model.item_num), dtype=np.float32)
-        feed_dict[model.negative_loss_mask] = np.zeros((batch_size, 0), dtype=np.float32)
+        neg = model.neg  # 使用模型的neg参数
+        feed_dict[model.negative_actions] = np.full((batch_size, neg), model.item_num, dtype=np.int32)  # 填充无效ID
+        feed_dict[model.negative_rewards] = np.zeros((batch_size, neg), dtype=np.float32)
+        feed_dict[model.negative_target_Qs] = np.zeros((batch_size, neg, model.max_candidates), dtype=np.float32)
+        feed_dict[model.negative_actor_target_probs] = np.zeros((batch_size, neg, model.max_candidates), dtype=np.float32)
+        feed_dict[model.negative_loss_mask] = np.zeros((batch_size, neg), dtype=np.float32)  # 掩码为0，损失无效
 
 
     return feed_dict
@@ -309,7 +332,7 @@ class OnPolicyRingBuffer:
         self.max_duplicate_per_edge = 3  # Max samples per (state, action) pair (reduced from 10 for better diversity in "slow drip" strategy)
         # Track collection batches for overlap calculation
         self.collection_history = []  # List of sets of transition hashes from recent collections
-        # 🔥 Performance optimization: Index task_key -> list of indices for fast sampling
+        #  Performance optimization: Index task_key -> list of indices for fast sampling
         self.task_key_index = {}  # {task_key: [indices]}
         
     def _hash_transition(self, transition):
@@ -451,7 +474,7 @@ class OnPolicyRingBuffer:
     
     def sample(self, n, stratified=False, success_ratio=0.35):
         """
-        🔥 智能三层分层采样（急救策略）
+ 智能三层分层采样（急救策略）
         
         Args:
             stratified: If True, use 3-tier stratified sampling
@@ -473,7 +496,7 @@ class OnPolicyRingBuffer:
             indices = np.random.choice(len(self.buffer), n, replace=False)
             return [self.buffer[i] for i in indices]
         
-        # 🔥 三层分类
+        #  三层分类
         def _safe_get_reward(t):
             """Safely get reward value, handling tuples and other types."""
             reward = t.get('reward', 0)
@@ -498,7 +521,7 @@ class OnPolicyRingBuffer:
         tier3_failure = [i for i in range(len(self.buffer)) 
                         if i not in tier1_success and i not in tier2_progress]
         
-        # 🔥 三层采样比例
+        #  三层采样比例
         n_tier1 = int(n * success_ratio)  # 35%成功
         n_tier2 = int(n * 0.30)  # 30%正进展
         n_tier3 = n - n_tier1 - n_tier2  # 35%失败/边界
@@ -558,7 +581,7 @@ class OnPolicyRingBuffer:
         """
         Sample n transitions from the buffer filtered by task_key.
         
-        🔥 Performance optimized: Uses task_key_index instead of full buffer scan.
+ Performance optimized: Uses task_key_index instead of full buffer scan.
         
         Args:
             stratified: If True, use stratified sampling
@@ -567,7 +590,7 @@ class OnPolicyRingBuffer:
         if len(self.buffer) == 0:
             return []
         
-        # 🔥 Performance optimization: Use index instead of scanning entire buffer
+        #  Performance optimization: Use index instead of scanning entire buffer
         if task_key in self.task_key_index:
             indices = self.task_key_index[task_key]
             # Filter out invalid indices (in case buffer was overwritten in ring buffer mode)
@@ -732,7 +755,7 @@ class OnPolicyRingBuffer:
         """Save buffer to pickle file (DataFrame format, compatible with replay_buffer.df)."""
         df = self.to_dataframe()
         df.to_pickle(file_path)
-        print(f"✅ O-buffer saved to {file_path} ({len(df)} transitions)")
+        print(f" O-buffer saved to {file_path} ({len(df)} transitions)")
         return df
     
     def load_from_file(self, file_path, max_size=None):
@@ -744,7 +767,7 @@ class OnPolicyRingBuffer:
             max_size: Maximum buffer size (if None, uses current max_size)
         """
         if not os.path.exists(file_path):
-            print(f"⚠️  O-buffer file not found: {file_path}")
+            print(f"  O-buffer file not found: {file_path}")
             return False
         
         try:
@@ -778,7 +801,7 @@ class OnPolicyRingBuffer:
                 if len(self.buffer) < self.max_size:
                     # Add to buffer
                     self.buffer.append(transition)
-                    # 🔥 Rebuild task_key index for fast sampling
+                    #  Rebuild task_key index for fast sampling
                     task_key = transition.get('task_key')
                     if task_key is not None:
                         if task_key not in self.task_key_index:
@@ -788,15 +811,15 @@ class OnPolicyRingBuffer:
                 else:
                     break  # Stop if buffer is full
             
-            print(f"✅ O-buffer loaded from {file_path} ({loaded_count}/{len(df)} transitions loaded, buffer_size={self.max_size})")
-            print(f"   🔥 Task_key index rebuilt: {len(self.task_key_index)} unique task_keys")
+            print(f" O-buffer loaded from {file_path} ({loaded_count}/{len(df)} transitions loaded, buffer_size={self.max_size})")
+            print(f"    Task_key index rebuilt: {len(self.task_key_index)} unique task_keys")
             
             # Rebuild edge_usage_count from loaded data (simplified, will rebuild during training)
             # Note: edge_usage_count will be rebuilt naturally as we add new samples
             
             return True
         except Exception as e:
-            print(f"❌ Failed to load O-buffer from {file_path}: {e}")
+            print(f" Failed to load O-buffer from {file_path}: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -815,7 +838,7 @@ class ImprovedQNetwork:
         self.learning_rate = learning_rate
         self.hidden_size = hidden_size
         self.feature_dim = int(feature_dim)
-        self.cand_feature_dim = int(cand_feature_dim)  # 🔥 候选边特征维度
+        self.cand_feature_dim = int(cand_feature_dim)  #  候选边特征维度
 
         # self.weight = weight
         self.dropout_rate = dropout_rate
@@ -851,14 +874,16 @@ class ImprovedQNetwork:
                                              tf.tile(tf.expand_dims(tf.range(self.state_size), 0),
                                                      [tf.shape(self.inputs)[0], 1]))
             self.seq = self.input_emb + pos_emb
-            
-            mask = tf.cast(tf.reduce_any(tf.not_equal(self.inputs, 0), axis=-1), tf.float32)
-            mask = tf.expand_dims(mask, -1)
-            
+
+            #  修复序列mask：使用len_state而非值判断，避免token中0值导致的错误mask
+            seq_mask = tf.sequence_mask(self.len_state, maxlen=self.state_size)  # [batch, state_size]
+            seq_mask = tf.expand_dims(seq_mask, -1)  # [batch, state_size, 1]
+            seq_mask = tf.cast(seq_mask, tf.float32)
+
             self.seq = tf.cond(self.is_training,
                 lambda: tf.nn.dropout(self.seq, rate=self.dropout_rate),
                 lambda: self.seq)
-            self.seq *= mask
+            self.seq *= seq_mask
 
             for i in range(self.num_blocks):
                 with tf.compat.v1.variable_scope("num_blocks_%d" % i):
@@ -876,12 +901,12 @@ class ImprovedQNetwork:
                                            is_training=self.is_training,
                                            block_id=i)
 
-                    self.seq *= mask
+                    self.seq *= seq_mask
 
             self.seq = normalize(self.seq)
             self.states_hidden = extract_axis_1(self.seq, self.len_state - 1)
             
-            # 🔥 RL去耦：创建两个版本的编码器输出
+            #  RL去耦：创建两个版本的编码器输出
             # Q head使用stop_gradient版本，RL梯度不会反传到编码器
             # SL head使用正常版本，SL梯度正常反传
             self.states_hidden_for_q = tf.stop_gradient(self.states_hidden)   # RL不反传到编码器
@@ -895,9 +920,9 @@ class ImprovedQNetwork:
                 biases1 = tf.compat.v1.get_variable('biases', 
                     [self.item_num],
                     initializer=tf.compat.v1.zeros_initializer())
-                # 🔥 修复：Q值直接输出，不用sigmoid
+                #  修复：Q值直接输出，不用sigmoid
                 # 原因：TRFL需要Q值可以是任意实数（支持负reward）
-                # 🔥 RL去耦：使用stop_gradient版本，RL梯度不反传到编码器
+                #  RL去耦：使用stop_gradient版本，RL梯度不反传到编码器
                 self.output1 = tf.matmul(self.states_hidden_for_q, weights1) + biases1
             
             with tf.compat.v1.variable_scope('output2'):
@@ -907,12 +932,52 @@ class ImprovedQNetwork:
                 biases2 = tf.compat.v1.get_variable('biases', 
                     [self.item_num],
                     initializer=tf.compat.v1.zeros_initializer())
-                # 🔥 SL head使用正常版本，梯度正常反传
+                #  SL head使用正常版本，梯度正常反传
                 self.output2 = tf.matmul(self.states_hidden_for_sl, weights2) + biases2
 
             # NEW: Candidate-based action selection placeholders (must be defined before use)
             self.cand_features = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates, self.cand_feature_dim], name='cand_features')
             self.cand_mask = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates], name='cand_mask')
+
+            #  新增：SL头的候选边分类机制（跨图兼容）
+            with tf.compat.v1.variable_scope('sl_candidate_output'):
+            # SL候选边特征处理（复用Q头的特征处理逻辑）
+                sl_cand_weights = tf.compat.v1.get_variable('sl_cand_weights',
+                    [self.cand_feature_dim, self.hidden_size],
+                    initializer=tf.compat.v1.glorot_normal_initializer())
+                sl_cand_biases = tf.compat.v1.get_variable('sl_cand_biases',
+                    [self.hidden_size],
+                    initializer=tf.compat.v1.zeros_initializer())
+
+                # 处理候选边特征： [batch, max_candidates, cand_feature_dim] -> [batch, max_candidates, hidden_size]
+                sl_cand_processed = tf.nn.relu(tf.matmul(
+                    tf.reshape(self.cand_features, [-1, self.cand_feature_dim]), sl_cand_weights) + sl_cand_biases)
+                sl_cand_processed = tf.reshape(sl_cand_processed, [-1, self.max_candidates, self.hidden_size])
+
+                # 将SL状态表征扩展到候选边维度
+                sl_state_expanded = tf.expand_dims(self.states_hidden_for_sl, 1)
+                sl_state_tiled = tf.tile(sl_state_expanded, [1, self.max_candidates, 1])
+
+                # 融合SL状态表征和候选边特征： [batch, max_candidates, 2*hidden_size]
+                sl_combined_features = tf.concat([sl_state_tiled, sl_cand_processed], axis=-1)
+
+                # SL候选边分类： [batch, max_candidates, 2*hidden_size] -> [batch, max_candidates]
+                sl_final_weights = tf.compat.v1.get_variable('sl_final_weights',
+                    [2 * self.hidden_size, 1],
+                    initializer=tf.compat.v1.glorot_normal_initializer())
+                sl_final_biases = tf.compat.v1.get_variable('sl_final_biases',
+                    [1],
+                    initializer=tf.compat.v1.zeros_initializer())
+
+                self.output2_candidates = tf.squeeze(tf.matmul(
+                    tf.reshape(sl_combined_features, [-1, 2 * self.hidden_size]), sl_final_weights) + sl_final_biases)
+                self.output2_candidates = tf.reshape(self.output2_candidates, [-1, self.max_candidates])
+
+                # 应用候选边mask
+                self.output2_masked = self.output2_candidates + (1.0 - self.cand_mask) * -1e9
+
+                #  新增：候选边版本的SL训练输出（用于跨图兼容）
+                self.output2_candidates_for_training = self.output2_candidates
 
             # NEW: Candidate-based action selection outputs
             with tf.compat.v1.variable_scope('candidate_output'):
@@ -958,12 +1023,12 @@ class ImprovedQNetwork:
             # Training phase placeholder
             self.training_phase = tf.compat.v1.placeholder(tf.int32, name='training_phase')
             
-            # 🔥 强化Mask penalty：确保无效动作Q值足够低
+            #  强化Mask penalty：确保无效动作Q值足够低
             q_value_max = tf.reduce_max(self.output1, axis=1, keepdims=True)
             q_value_min = tf.reduce_min(self.output1, axis=1, keepdims=True)
             q_value_range = q_value_max - q_value_min
             
-            # 🔥 修复：使用更强的mask_penalty，确保无效动作Q值远低于有效动作
+            #  修复：使用更强的mask_penalty，确保无效动作Q值远低于有效动作
             # 对于Q值范围[0,1]，使用-2.0确保无效动作Q值足够低
             pen_by_range = -2.0 * tf.stop_gradient(q_value_range)  # 更强惩罚
             pen_below_min = tf.stop_gradient(q_value_min) - 2.0     # 更强惩罚
@@ -979,9 +1044,12 @@ class ImprovedQNetwork:
             
             # Training and inference logits (simplified without SL prior)
             self.output1_for_training = self.output1 + mask_penalty * (1.0 - tf.cast(self.action_mask, tf.float32))
+            #  新增：候选边版本的训练输出（与output1_masked保持一致）
+            self.output1_candidates_for_training = self.output1_candidates + mask_penalty * (1.0 - tf.cast(self.cand_mask, tf.float32))
+            self.output2_candidates_for_training = self.output2_candidates + mask_penalty * (1.0 - tf.cast(self.cand_mask, tf.float32))
             self.output2_for_training = self.output2 + mask_penalty * (1.0 - tf.cast(self.action_mask, tf.float32))
             
-            # 🔥 路A改造：添加SL先验融合
+            #  路A改造：添加SL先验融合
             # self.sl_prior_beta = tf.compat.v1.placeholder(tf.float32, name='sl_prior_beta')
             # self.use_sl_prior = tf.compat.v1.placeholder(tf.bool, name='use_sl_prior')
             
@@ -993,26 +1061,30 @@ class ImprovedQNetwork:
             
             # 根据是否使用SL先验选择Q值
             self.q_for_action_selection = self.output1
-            
-            # For inference, use action mask directly
-            self.output1_masked = self.output1 * tf.cast(self.action_mask, tf.float32) + mask_penalty * (1.0 - tf.cast(self.action_mask, tf.float32))
-            self.output2_masked = self.output2 * tf.cast(self.action_mask, tf.float32) + mask_penalty * (1.0 - tf.cast(self.action_mask, tf.float32))
+
+            #  在新架构中，output1_masked已经是候选边版本（上面已定义）
+            # 无需重新定义为全局版本
+            # self.output2_masked 现在使用候选边版本（在上面已定义）
             
             # SL先验增强的Q值（用于动作选择）
             # self.q_for_action_selection_masked = self.q_for_action_selection * tf.cast(self.action_mask, tf.float32) + mask_penalty * (1.0 - tf.cast(self.action_mask, tf.float32))
             
             # Action inputs
             self.actions = tf.compat.v1.placeholder(tf.int32, [None])
+            #  新增：候选边动作索引（用于SL训练和RL训练）
+            self.bc_action_idx = tf.compat.v1.placeholder(tf.int32, [None], name='bc_action_idx')
+            # New: Candidate edge action indices for RL training（从全局edge_id转换为候选边索引）
+            self.rl_action_cand_idx = tf.compat.v1.placeholder(tf.int32, [None], name='rl_action_cand_idx')
             # Placeholders
             self.reward = tf.compat.v1.placeholder(tf.float32, [None])
             self.discount = tf.compat.v1.placeholder(tf.float32, [None])
-            self.targetQs_ = tf.compat.v1.placeholder(tf.float32, [None, item_num])
-            self.targetQs_selector = tf.compat.v1.placeholder(tf.float32, [None, item_num])
-            # 🔥 Actor-Critic DDPG-style: Actor target probs placeholder
-            self.actor_target_probs = tf.compat.v1.placeholder(tf.float32, [None, item_num], name='actor_target_probs')
-            # 🔥 清理：删除未使用的target_Q_current相关placeholders
+            self.targetQs_ = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates])
+            self.targetQs_selector = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates])
+            #  Actor-Critic DDPG-style: Actor target probs placeholder
+            self.actor_target_probs = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates], name='actor_target_probs')
+            #  清理：删除未使用的target_Q_current相关placeholders
             
-            # 🔥 Actor-Critic DDPG-style: Soft expectation target for Critic
+            #  Actor-Critic DDPG-style: Soft expectation target for Critic
             # V_tgt(s') = Σ π_tgt(a'|s') · Q_target(s', a')
             # y = r + γ * (1 - done) * V_tgt(s')
             
@@ -1025,10 +1097,11 @@ class ImprovedQNetwork:
             td_target = self.reward + self.discount * soft_v_target
             td_target = tf.stop_gradient(td_target)
             
-            # Current Q value: Q(s, a)
-            batch_indices = tf.range(tf.shape(self.actions)[0])
-            action_indices = tf.stack([batch_indices, self.actions], axis=1)
-            current_q = tf.gather_nd(self.output1_for_training, action_indices)
+            #  RL现在也使用候选边版本的Q值
+            # Current Q value: Q(s, a) - 从候选边Q值中gather
+            batch_indices = tf.range(tf.shape(self.rl_action_cand_idx)[0])
+            action_indices = tf.stack([batch_indices, self.rl_action_cand_idx], axis=1)
+            current_q = tf.gather_nd(self.output1_candidates_for_training, action_indices)
             
             # Huber loss (same as TRFL for stability)
             td_error = td_target - current_q
@@ -1041,10 +1114,10 @@ class ImprovedQNetwork:
             # 负样本TD学习：使用相同的软期望目标
             self.negative_actions = tf.compat.v1.placeholder(tf.int32, [None, None], name='negative_actions')
             self.negative_rewards = tf.compat.v1.placeholder(tf.float32, [None, None], name='negative_rewards')
-            self.negative_target_Qs = tf.compat.v1.placeholder(tf.float32, [None, None, item_num], name='negative_target_Qs')
-            self.negative_actor_target_probs = tf.compat.v1.placeholder(tf.float32, [None, None, item_num], name='negative_actor_target_probs')
+            self.negative_target_Qs = tf.compat.v1.placeholder(tf.float32, [None, None, self.max_candidates], name='negative_target_Qs')
+            self.negative_actor_target_probs = tf.compat.v1.placeholder(tf.float32, [None, None, self.max_candidates], name='negative_actor_target_probs')
             self.negative_loss_weight = tf.compat.v1.placeholder(tf.float32, name='negative_loss_weight')
-            # 🔥 添加负样本损失掩码，用于处理填充位
+            #  添加负样本损失掩码，用于处理填充位
             self.negative_loss_mask = tf.compat.v1.placeholder(tf.float32, [None, None], name='negative_loss_mask')
             
             # 使用固定负样本数量计算平均值
@@ -1056,9 +1129,9 @@ class ImprovedQNetwork:
                 neg_reward = tf.gather(self.negative_rewards, i, axis=1)
                 neg_mask = tf.gather(self.negative_loss_mask, i, axis=1)
                 
-                # 🔥 Actor-Critic DDPG-style: Soft expectation target for negative samples
-                neg_target_Q = tf.gather(self.negative_target_Qs, i, axis=1)  # [batch, item_num]
-                neg_actor_probs = tf.gather(self.negative_actor_target_probs, i, axis=1)  # [batch, item_num]
+                #  Actor-Critic DDPG-style: Soft expectation target for negative samples
+                neg_target_Q = tf.gather(self.negative_target_Qs, i, axis=1)  # [batch, max_candidates]
+                neg_actor_probs = tf.gather(self.negative_actor_target_probs, i, axis=1)  # [batch, max_candidates]
                 
                 # V_tgt(s') = Σ π_tgt(a'|s') · Q_target(s', a')
                 neg_soft_v_target = tf.reduce_sum(neg_actor_probs * neg_target_Q, axis=1)
@@ -1079,59 +1152,70 @@ class ImprovedQNetwork:
                     reduction=tf.compat.v1.losses.Reduction.NONE
                 )
                 
-                # 🔥 应用损失掩码，对填充位置零损失
+                #  应用损失掩码，对填充位置零损失
                 masked_neg_loss = neg_huber_loss * neg_mask
                 qloss_negative += masked_neg_loss
             
-            # 🔥 使用掩码归一化，避免填充位影响平均值
+            #  使用掩码归一化，避免填充位影响平均值
             total_mask = tf.reduce_sum(self.negative_loss_mask)
             if self.neg > 0:
                 self.negative_q_loss = qloss_negative / tf.maximum(total_mask, 1.0)
             else:
                 self.negative_q_loss = 0.0
             
-            # 🔥 Actor SL Loss (主损：监督学习，模仿专家)
-            ce_loss_pre = tf.compat.v1.nn.sparse_softmax_cross_entropy_with_logits(labels=self.actions, logits=self.output2_for_training)
-            self.ce_loss = tf.reduce_mean(ce_loss_pre)
+            #  SL候选边损失（跨图兼容）- 唯一损失函数
+            # 过滤掉无效的bc_action_idx，只计算有效样本的损失
+            valid_bc_mask = tf.greater_equal(self.bc_action_idx, 0)
+            valid_labels = tf.boolean_mask(self.bc_action_idx, valid_bc_mask)
+            valid_logits = tf.boolean_mask(self.output2_candidates_for_training, valid_bc_mask)
+
+            # 候选边交叉熵损失
+            self.ce_loss = tf.cond(
+                tf.reduce_any(valid_bc_mask),
+                lambda: tf.reduce_mean(tf.compat.v1.nn.sparse_softmax_cross_entropy_with_logits(
+                    labels=valid_labels, logits=valid_logits)),
+                lambda: tf.constant(0.0)  # 如果没有有效样本，返回0
+            )
 
 
-            # 🔥 Actor-Critic DDPG-style: Actor RL auxiliary loss
+            #  Actor-Critic DDPG-style: Actor RL auxiliary loss
             # L_RL = -E[Σ π(a|s) · Q(s,a)] (maximize expected Q, minimize negative expected Q)
             # Only computed on valid actions (action mask applied)
             
-            # Compute actor policy: π(a|s)
-            actor_probs = tf.nn.softmax(self.output2_for_training)  # [batch, item_num]
-            
+            #  Actor现在也使用候选边版本
+            # Compute actor policy: π(a|s) - 候选边空间
+            actor_probs_candidates = tf.nn.softmax(self.output2_candidates_for_training)  # [batch, max_candidates]
+
             # Expected Q under current actor policy: Σ π(a|s) · Q(s,a)
-            # Only sum over valid actions (action_mask already applied to output)
-            expected_q = tf.reduce_sum(actor_probs * self.output1_for_training, axis=1)  # [batch]
+            # Sum over candidate actions only
+            expected_q = tf.reduce_sum(actor_probs_candidates * self.output1_candidates_for_training, axis=1)  # [batch]
             
             # Actor RL loss: minimize negative expected Q (i.e., maximize expected Q)
             # Note: gradient only flows through actor (π), not critic (Q)
             expected_q_for_actor = tf.reduce_sum(
-                actor_probs * tf.stop_gradient(self.output1_for_training), 
+                actor_probs_candidates * tf.stop_gradient(self.output1_candidates_for_training),
                 axis=1
             )
             self.actor_rl_loss = -tf.reduce_mean(expected_q_for_actor)
             
-            # 🔥 Critic Loss组件
+            #  Critic Loss组件
             # 分离base loss和total loss以便监控
             self.q_loss_base = tf.reduce_mean(qloss_positive)
-            # 🔥 总Q损失 = 主损失 + 负样本惩罚
+            #  总Q损失 = 主损失 + 负样本惩罚
             self.q_loss = self.q_loss_base + self.negative_loss_weight * self.negative_q_loss
             
-            # 🔥 权重参数
+            #  权重参数
             self.rl_weight = tf.compat.v1.placeholder(tf.float32, name='rl_weight')
             self.actor_rl_weight = tf.compat.v1.placeholder(tf.float32, name='actor_rl_weight')  # λ_RL for actor
             
             self.q_loss_weighted = self.rl_weight * self.q_loss
             self.actor_rl_loss_weighted = self.actor_rl_weight * self.actor_rl_loss
 
-            # 🔥 Actor 总损失 = λ_SL · L_SL + λ_RL · L_RL
+            #  Actor 总损失 = λ_SL · L_SL + λ_RL · L_RL
             self.actor_total_loss = self.ce_loss + self.actor_rl_loss_weighted
-            
+
             # 三阶段训练损失定义
-            phase1_sl_only_loss = self.ce_loss  # Phase 1: SL only
+            phase1_sl_only_loss = self.ce_loss  # Phase 1: SL only (候选边损失)
             phase2_sl_rl_loss = self.actor_total_loss + self.q_loss_weighted  # Phase 2+: Actor (SL+RL) + Critic
             
             self.balanced_loss = tf.case([
@@ -1154,7 +1238,7 @@ class ImprovedQNetwork:
             )
             self.sl_head_vars = tf.compat.v1.get_collection(
                 tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES,
-                scope=f"{self.name}/output2"
+                scope=f"{self.name}/sl_candidate_output"
             )
             
             all_vars = tf.compat.v1.get_collection(
@@ -1170,14 +1254,14 @@ class ImprovedQNetwork:
                 'balanced_loss': self.balanced_loss,
                 'phase1_sl_only_loss': phase1_sl_only_loss,
                 'phase2_sl_rl_loss': phase2_sl_rl_loss,
-                # 🔥 Actor losses
+                #  Actor losses
                 'ce_loss': self.ce_loss,
                 'actor_rl_loss': self.actor_rl_loss,
                 'actor_rl_loss_weighted': self.actor_rl_loss_weighted,
                 'actor_total_loss': self.actor_total_loss,
                 'actor_rl_weight': self.actor_rl_weight,
                 'expected_q': tf.reduce_mean(expected_q),
-                # 🔥 Critic losses
+                #  Critic losses
                 'q_loss': self.q_loss,
                 'q_loss_base': self.q_loss_base,
                 'negative_q_loss': self.negative_q_loss,
@@ -1186,7 +1270,7 @@ class ImprovedQNetwork:
                 'qloss_positive': tf.reduce_mean(qloss_positive),
                 'td_error_mean': tf.reduce_mean(tf.abs(td_error)),
                 'soft_v_target_mean': tf.reduce_mean(soft_v_target),
-                # 🔥 General
+                #  General
                 'training_phase': self.training_phase,
                 'rl_weight': self.rl_weight,
                 'mask_penalty': self.mask_penalty_value,
@@ -1207,15 +1291,15 @@ class ImprovedQNetwork:
             self.q_head_optimizer = tf.compat.v1.train.AdamOptimizer(self.lr_2).minimize(
                 self.q_loss, var_list=self.q_head_vars
             )
-            # 🔥 Actor optimizer: minimize actor_total_loss (SL + RL auxiliary)
+            #  Actor optimizer: minimize actor_total_loss (SL + RL auxiliary)
             self.sl_head_optimizer = tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(
                 self.actor_total_loss, var_list=self.sl_head_vars
             )
             
-            # 🔥 RL去耦：共享编码器只使用SL梯度更新
+            #  RL去耦：共享编码器只使用SL梯度更新
             # Q head已经使用了stop_gradient，所以Q梯度不会流回编码器
             # 因此不需要梯度合成，只使用SL梯度
-            # 🔥 Actor gradient: use actor_total_loss (SL + RL auxiliary)
+            #  Actor gradient: use actor_total_loss (SL + RL auxiliary)
             self.sl_grads = tf.gradients(self.actor_total_loss, self.shared_encoder_vars)
             
             # 不再需要Q梯度和梯度合成（因为Q head已经被stop_gradient隔离）
@@ -1263,35 +1347,58 @@ class ImprovedQNetwork:
             self.train_phase1 = tf.group(self.sl_head_optimizer, self.phase1_shared_optimizer)
             self.train_phase2_joint = tf.group(self.q_head_optimizer, self.sl_head_optimizer, self.shared_encoder_optimizer)
             
-            # Probability output for evaluation
+            # Probability output for evaluation (使用候选边版本)
             self.probs = tf.nn.softmax(self.output2_masked)
             self.train_vars = tf.compat.v1.get_collection(
                 tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, scope=self.name)
             
-            # 🔥 Actor-Critic DDPG-style: Create Actor Target network
+            #  Actor-Critic DDPG-style: Create Actor Target network
             # Used to compute soft expectation target for Critic: V_tgt(s') = Σ π_tgt(a'|s') · Q_target(s', a')
             with tf.compat.v1.variable_scope('actor_target'):
-                # Reuse the same architecture as output2 (Actor/SL head)
-                actor_target_weights = tf.compat.v1.get_variable('weights', 
-                    [self.hidden_size, self.item_num],
-                    initializer=tf.compat.v1.glorot_normal_initializer())
-                actor_target_biases = tf.compat.v1.get_variable('biases', 
-                    [self.item_num],
-                    initializer=tf.compat.v1.zeros_initializer())
-                
+                #  Actor target now uses candidate-based architecture (same as SL head)
+                # Need placeholders for next state candidate features
+                self.next_cand_features = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates, self.cand_feature_dim], name='next_cand_features')
+                self.next_cand_mask = tf.compat.v1.placeholder(tf.float32, [None, self.max_candidates], name='next_cand_mask')
+
                 # Input: next state hidden features (will be fed during training)
                 self.next_states_hidden = tf.compat.v1.placeholder(tf.float32, [None, self.hidden_size], name='next_states_hidden')
-                self.actor_target_logits = tf.matmul(self.next_states_hidden, actor_target_weights) + actor_target_biases
-                
-                # Apply action mask to actor target
-                self.next_action_mask = tf.compat.v1.placeholder(tf.float32, [None, item_num], name='next_action_mask')
-                # 🔥 Use fixed penalty to avoid dependency on mask_penalty_value (which depends on whole graph)
+
+                # Actor target candidate feature processing (same as SL head)
+                actor_target_cand_weights = tf.compat.v1.get_variable('cand_weights',
+                    [self.cand_feature_dim, self.hidden_size],
+                    initializer=tf.compat.v1.glorot_normal_initializer())
+                actor_target_cand_biases = tf.compat.v1.get_variable('cand_biases',
+                    [self.hidden_size],
+                    initializer=tf.compat.v1.zeros_initializer())
+
+                actor_target_cand_processed = tf.nn.relu(tf.matmul(
+                    tf.reshape(self.next_cand_features, [-1, self.cand_feature_dim]), actor_target_cand_weights) + actor_target_cand_biases)
+                actor_target_cand_processed = tf.reshape(actor_target_cand_processed, [-1, self.max_candidates, self.hidden_size])
+
+                # Expand next state hidden features to candidate dimensions
+                next_states_expanded = tf.expand_dims(self.next_states_hidden, 1)
+                next_states_tiled = tf.tile(next_states_expanded, [1, self.max_candidates, 1])
+
+                # Fuse next state features with candidate features
+                actor_target_combined = tf.concat([next_states_tiled, actor_target_cand_processed], axis=-1)
+
+                # Final classification layer
+                actor_target_final_weights = tf.compat.v1.get_variable('final_weights',
+                    [2 * self.hidden_size, 1],
+                    initializer=tf.compat.v1.glorot_normal_initializer())
+                actor_target_final_biases = tf.compat.v1.get_variable('final_biases',
+                    [1],
+                    initializer=tf.compat.v1.zeros_initializer())
+
+                self.actor_target_logits = tf.squeeze(tf.matmul(
+                    tf.reshape(actor_target_combined, [-1, 2 * self.hidden_size]), actor_target_final_weights) + actor_target_final_biases)
+                self.actor_target_logits = tf.reshape(self.actor_target_logits, [-1, self.max_candidates])
+
+                # Apply candidate mask to actor target
                 mask_penalty_target = -10.0  # Fixed large negative value for invalid actions
-                self.actor_target_logits_masked = self.actor_target_logits + mask_penalty_target * (1.0 - tf.cast(self.next_action_mask, tf.float32))
-                
-                # Compute actor target policy output: π_tgt(a'|s')
-                # Note: self.actor_target_probs is a placeholder (defined earlier) for training
-                # This output is used to compute the values that will be fed to that placeholder
+                self.actor_target_logits_masked = self.actor_target_logits + mask_penalty_target * (1.0 - self.next_cand_mask)
+
+                # Compute actor target policy output: π_tgt(a'|s') - candidate-based
                 self.actor_target_output = tf.nn.softmax(self.actor_target_logits_masked)
             
             # Get actor target variables for Polyak update
@@ -1334,7 +1441,7 @@ if __name__ == '__main__':
             raise FileNotFoundError(f"MOE user data directory not found: {user_data_dir}")
         print(f"   User data directory: {user_data_dir}")
     else:
-        print("📊 Standard Mode: Single-user training")
+        print(" Standard Mode: Single-user training")
     
     # Two-Stage Training Logic
     # 优先使用用户指定的路径，否则自动查找
@@ -1353,10 +1460,10 @@ if __name__ == '__main__':
     
     # Check if Stage-1 model exists
     if os.path.exists(stage1_model_path + '.meta'):
-        print(f"🚀 Loading Stage-1 SL-only model from {stage1_model_path}")
+        print(f" Loading Stage-1 SL-only model from {stage1_model_path}")
         load_stage1_model = True
     else:
-        print(f"⚠️ Stage-1 model not found at {stage1_model_path}")
+        print(f" Stage-1 model not found at {stage1_model_path}")
         print(f"   Will run Stage-1 SL-only training first...")
         load_stage1_model = False
 
@@ -1374,7 +1481,7 @@ if __name__ == '__main__':
 
     reward_goal = args.r_goal
 
-    # 🔥 初始化文本 Embedding 集成器（如果启用）
+    #  初始化文本 Embedding 集成器（如果启用）
     text_embedding_loader = None
     embedding_proj_weights = None
     embedding_proj_biases = None
@@ -1382,20 +1489,20 @@ if __name__ == '__main__':
     
     if args.use_text_embeddings:
         if not TEXT_EMBEDDING_AVAILABLE:
-            print("⚠️  WARNING: Text embedding modules not available. Disabling text embeddings.")
+            print("  WARNING: Text embedding modules not available. Disabling text embeddings.")
             if '_TEXT_EMBEDDING_IMPORT_ERROR' in globals():
                 print(f"   Import error: {_TEXT_EMBEDDING_IMPORT_ERROR}")
                 if 'lmdb' in _TEXT_EMBEDDING_IMPORT_ERROR.lower():
-                    print("   💡 Hint: Install lmdb with: pip install lmdb")
+                    print("    Hint: Install lmdb with: pip install lmdb")
             args.use_text_embeddings = False
         else:
             try:
                 text_embedding_loader = TextEmbeddingLoader(
                     args.text_embedding_cache_dir,
                     readonly=True,
-                    preload_all=True  # 🔥 预加载所有 embeddings 到内存
+                    preload_all=True  #  预加载所有 embeddings 到内存
                 )
-                print(f"✅ Text embedding loader initialized from {args.text_embedding_cache_dir}")
+                print(f" Text embedding loader initialized from {args.text_embedding_cache_dir}")
                 print(f"   Embedding dim: {text_embedding_loader.hidden_dim}")
                 
                 # 计算增强后的 feature_dim
@@ -1440,21 +1547,21 @@ if __name__ == '__main__':
                     embedding_proj_biases['goal'] = np.zeros(args.embedding_proj_dim, dtype=np.float32)
                 
                 print(f"   Initialized projection weights (numpy, will be replaced by TF trained weights)")
-                print(f"   🔥 Using embeddings: edge={args.use_edge_embedding}, node={args.use_node_embedding}, goal={args.use_goal_embedding}")
+                print(f"    Using embeddings: edge={args.use_edge_embedding}, node={args.use_node_embedding}, goal={args.use_goal_embedding}")
                 
             except Exception as e:
-                print(f"❌ ERROR: Failed to initialize text embedding loader: {e}")
+                print(f" ERROR: Failed to initialize text embedding loader: {e}")
                 print("   Disabling text embeddings.")
                 args.use_text_embeddings = False
                 text_embedding_loader = None
 
-    # 🔥 加载用户 embedding（如果启用）
+    #  加载用户 embedding（如果启用）
     user_embedding = None
     user_embeddings_dict = None
     user_dim = 0
     
     if args.use_user_embedding:
-        print(f"\n🧑 User Embedding Mode: ENABLED")
+        print(f"\n User Embedding Mode: ENABLED")
         
         if args.user_id is not None:
             # 单用户模式：加载指定用户的embedding
@@ -1463,10 +1570,10 @@ if __name__ == '__main__':
             if user_embedding is not None:
                 user_dim = len(user_embedding)
                 enhanced_feature_dim += user_dim
-                print(f"✅ User embedding loaded: dim={user_dim}")
+                print(f" User embedding loaded: dim={user_dim}")
                 print(f"   Final enhanced feature_dim: {enhanced_feature_dim} (base={feature_dim}, text={text_dim if args.use_text_embeddings else 0}, user={user_dim})")
             else:
-                print(f"⚠️  User embedding not found for {args.user_id}, proceeding without it")
+                print(f"  User embedding not found for {args.user_id}, proceeding without it")
                 args.use_user_embedding = False
         else:
             # 多用户模式：加载所有用户的embeddings
@@ -1477,15 +1584,15 @@ if __name__ == '__main__':
                 first_user_emb = next(iter(user_embeddings_dict.values()))
                 user_dim = len(first_user_emb)
                 enhanced_feature_dim += user_dim
-                print(f"✅ Loaded {len(user_embeddings_dict)} user embeddings")
+                print(f" Loaded {len(user_embeddings_dict)} user embeddings")
                 print(f"   User embedding dim: {user_dim}")
                 print(f"   Final enhanced feature_dim: {enhanced_feature_dim} (base={feature_dim}, text={text_dim if args.use_text_embeddings else 0}, user={user_dim})")
             else:
-                print(f"⚠️  No user embeddings found in {args.moe_data_dir}, proceeding without them")
+                print(f"  No user embeddings found in {args.moe_data_dir}, proceeding without them")
                 args.use_user_embedding = False
                 user_embeddings_dict = None
     else:
-        print(f"\n🧑 User Embedding Mode: DISABLED (use --use_user_embedding to enable)")
+        print(f"\n User Embedding Mode: DISABLED (use --use_user_embedding to enable)")
 
     tf.compat.v1.reset_default_graph()
 
@@ -1499,7 +1606,7 @@ if __name__ == '__main__':
 
     item_num = G.number_of_edges()
 
-    # 🔥 使用增强后的 feature_dim（包含text embeddings和user embeddings）
+    #  使用增强后的 feature_dim（包含text embeddings和user embeddings）
     # enhanced_feature_dim已经根据是否启用text/user embeddings正确更新
     model_feature_dim = enhanced_feature_dim
     
@@ -1508,40 +1615,67 @@ if __name__ == '__main__':
                            dropout_rate=args.dropout_rate,
                            num_heads=args.num_heads, num_blocks=args.num_blocks, lr_2=args.lr_2, neg=args.neg,
                            max_candidates=args.max_candidates if hasattr(args, 'max_candidates') else 20,
-                           cand_feature_dim=12,  # 🔥 候选边特征维度（12维）
+                           cand_feature_dim=12,  #  候选边特征维度（12维）
                            )
     QN_2 = ImprovedQNetwork(name='QN_2', hidden_size=args.hidden_factor, learning_rate=args.lr,
                            feature_dim=model_feature_dim, item_num=item_num, state_size=state_size,
                            dropout_rate=args.dropout_rate,
                            num_heads=args.num_heads, num_blocks=args.num_blocks, lr_2=args.lr_2, neg=args.neg,
                            max_candidates=args.max_candidates if hasattr(args, 'max_candidates') else 20,
-                           cand_feature_dim=12,  # 🔥 候选边特征维度（12维）
+                           cand_feature_dim=12,  #  候选边特征维度（12维）
                            )
     hard_update_ops = build_hard_update_ops(QN_1.train_vars, QN_2.train_vars)
-    soft_update_ops = build_soft_update_ops(QN_1.train_vars, QN_2.train_vars, tau=0.001)  # 🔥 使用降低的tau
+    soft_update_ops = build_soft_update_ops(QN_1.train_vars, QN_2.train_vars, tau=0.001)  #  使用降低的tau
     
-    # 🔥 Actor-Critic DDPG-style: Build Actor target update operations
-    actor_target_soft_update_ops = build_soft_update_ops(QN_1.actor_main_vars, QN_1.actor_target_vars, tau=0.001)  # 🔥 使用降低的tau
+    #  Actor-Critic DDPG-style: Build Actor target update operations
+    actor_target_soft_update_ops = build_soft_update_ops(QN_1.actor_main_vars, QN_1.actor_target_vars, tau=0.001)  #  使用降低的tau
     actor_target_hard_update_ops = build_hard_update_ops(QN_1.actor_main_vars, QN_1.actor_target_vars)
 
     # Initialize global_step based on whether we're loading Stage-1 model
     if load_stage1_model:
-        global_step = args.phase1_sl_only_steps  # 🔥 从Stage-1结束的步数开始
-        # 🔥 确保global_step是整数，避免tuple/float比较错误
-        print(f"🎯 Starting from global_step={global_step} (Stage-1 completed)")
+        global_step = args.phase1_sl_only_steps  #  从Stage-1结束的步数开始
+        #  确保global_step是整数，避免tuple/float比较错误
+        print(f" Starting from global_step={global_step} (Stage-1 completed)")
     else:
         global_step = 0
-        print(f"🎯 Starting from global_step={global_step} (fresh training)")
+        print(f" Starting from global_step={global_step} (fresh training)")
 
-    # 加载replay buffer（支持MOE）
-    replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df', args.graph_id)
-    if not os.path.exists(replay_buffer_path):
-        raise FileNotFoundError(f"Replay buffer file not found: {replay_buffer_path}")
-    replay_buffer = pd.read_pickle(replay_buffer_path)
-    original_size = len(replay_buffer)
-    print(f"✅ Loaded replay buffer from: {replay_buffer_path} ({original_size} transitions)")
+    # 加载训练数据
+    if args.use_eval_data_for_training:
+        # 使用evaluation数据确保与evaluation accuracy一致
+        eval_data_path = os.path.join(data_directory, 'graph_data', args.graph_id, 'trajectories', 'sampled_train.df')
+        if not os.path.exists(eval_data_path):
+            raise FileNotFoundError(f"Evaluation training data file not found: {eval_data_path}")
+        replay_buffer = pd.read_pickle(eval_data_path)
+        original_size = len(replay_buffer)
+        print(f" Loaded TRAINING data from evaluation source: {eval_data_path} ({original_size} transitions)")
+        print("   NOTE: Using evaluation data for training to ensure accuracy consistency!")
+    else:
+        # 使用传统的replay buffer
+        replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df', args.graph_id)
+        if not os.path.exists(replay_buffer_path):
+            raise FileNotFoundError(f"Replay buffer file not found: {replay_buffer_path}")
+        replay_buffer = pd.read_pickle(replay_buffer_path)
+        original_size = len(replay_buffer)
+        print(f" Loaded replay buffer from: {replay_buffer_path} ({original_size} transitions)")
+
+    # 检查replay buffer数据质量
+    print(f"  Replay buffer columns: {list(replay_buffer.columns)}")
+    if 'bc_action_idx' in replay_buffer.columns:
+        bc_idx_count = replay_buffer['bc_action_idx'].notna().sum()
+        print(f"  bc_action_idx available: {bc_idx_count}/{original_size} ({bc_idx_count/original_size*100:.1f}%)")
+        if bc_idx_count > 0:
+            print(f"  bc_action_idx sample: {replay_buffer['bc_action_idx'].dropna().head(5).tolist()}")
+    else:
+        print("  WARNING: bc_action_idx column missing from replay buffer!")
+
+    if 'taken_edge_id' in replay_buffer.columns:
+        taken_edge_count = replay_buffer['taken_edge_id'].notna().sum()
+        print(f"  taken_edge_id available: {taken_edge_count}/{original_size} ({taken_edge_count/original_size*100:.1f}%)")
+    else:
+        print("  WARNING: taken_edge_id column missing from replay buffer!")
     
-    # 🔥 根据 train_data_ratio 参数采样训练集
+    #  根据 train_data_ratio 参数采样训练集
     if args.train_data_ratio < 1.0:
         if args.train_data_ratio <= 0 or args.train_data_ratio > 1.0:
             raise ValueError(f"train_data_ratio must be between 0 and 1.0, got {args.train_data_ratio}")
@@ -1549,21 +1683,21 @@ if __name__ == '__main__':
         if sample_size < 1:
             raise ValueError(f"train_data_ratio {args.train_data_ratio} results in sample_size < 1 (original_size={original_size})")
         replay_buffer = replay_buffer.sample(n=sample_size, random_state=42).reset_index(drop=True)
-        print(f"📊 Sampled {len(replay_buffer)} transitions ({args.train_data_ratio*100:.1f}% of original {original_size} transitions)")
+        print(f" Sampled {len(replay_buffer)} transitions ({args.train_data_ratio*100:.1f}% of original {original_size} transitions)")
     else:
-        print(f"📊 Using full training set ({original_size} transitions, 100%)")
+        print(f" Using full training set ({original_size} transitions, 100%)")
 
     saver = tf.compat.v1.train.Saver()
     # Initialize training logger (修复logger未定义问题)
     logger = init_logger(os.path.join(data_directory, 'training_logs'))
     
     # Initialize on-policy ring buffer (O-bucket) for DAgger-lite
-    # 🔥 确保buffer_size是整数，避免tuple错误
+    #  确保buffer_size是整数，避免tuple错误
     normalized_buffer_size = args.onpolicy_buffer_size
     onpolicy_buffer = OnPolicyRingBuffer(max_size=normalized_buffer_size)
     print(f"Initialized on-policy ring buffer (O-bucket) with max_size={normalized_buffer_size}")
 
-    # 🔥 初始化 graph_cache 和 feature_builder（用于新格式数据和候选边特征重建）
+    #  初始化 graph_cache 和 feature_builder（用于新格式数据和候选边特征重建）
     graph_cache = None
     feature_builder = None
     try:
@@ -1571,9 +1705,10 @@ if __name__ == '__main__':
         multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
         graph_cache = multi_cache.get_cache(args.graph_id)
         feature_builder = multi_cache.get_feature_builder(args.graph_id)
-        print(f'✅ Loaded GraphCache and FeatureBuilder for graph "{args.graph_id}"')
+        print(f' Loaded GraphCache and FeatureBuilder for graph "{args.graph_id}"')
     except Exception as e:
-        print(f'⚠️  Could not load GraphCache/FeatureBuilder: {e}')
+        raise Exception(f'Could not load GraphCache/FeatureBuilder: {e}')
+        print(f'  Could not load GraphCache/FeatureBuilder: {e}')
         print(f'   Training will use old format data without candidate features')
 
     # Preload datasets if requested
@@ -1591,7 +1726,7 @@ if __name__ == '__main__':
         if not resume_ckpt.endswith('.index'):
             resume_ckpt = resume_ckpt.replace('.index', '')
     
-    # 🔥 Eval-only mode: Check if we need to load a checkpoint
+    #  Eval-only mode: Check if we need to load a checkpoint
     if args.eval_only:
         if resume_ckpt is not None and os.path.exists(resume_ckpt + ".index"):
             # User specified a valid checkpoint, use it
@@ -1615,14 +1750,14 @@ if __name__ == '__main__':
                         print(f"🔍 Eval-only mode: Found latest checkpoint: {resume_ckpt}")
                     else:
                         raise FileNotFoundError(
-                            f"❌ Eval-only mode requires a checkpoint. Please provide --resume_ckpt or ensure a checkpoint exists in {saved_model_dir}"
+                            f" Eval-only mode requires a checkpoint. Please provide --resume_ckpt or ensure a checkpoint exists in {saved_model_dir}"
                         )
                 else:
                     raise FileNotFoundError(
-                        f"❌ Eval-only mode requires a checkpoint. Please provide --resume_ckpt or ensure saved_model directory exists."
+                        f" Eval-only mode requires a checkpoint. Please provide --resume_ckpt or ensure saved_model directory exists."
                     )
     
-    # 🔥 配置 GPU 内存增长，避免一次性分配所有内存
+    #  配置 GPU 内存增长，避免一次性分配所有内存
     gpu_options = tf.compat.v1.GPUOptions(allow_growth=True)
     config = tf.compat.v1.ConfigProto(gpu_options=gpu_options)
     config.gpu_options.allow_growth = True
@@ -1630,19 +1765,19 @@ if __name__ == '__main__':
     with tf.compat.v1.Session(config=config) as sess:
         sess.run(tf.compat.v1.global_variables_initializer())
         sess.run(hard_update_ops)
-        # 🔥 Actor-Critic DDPG-style: Initialize Actor target
+        #  Actor-Critic DDPG-style: Initialize Actor target
         sess.run(actor_target_hard_update_ops)
         
-        # 🔥 Load Stage-1 model if available (优先级高于resume_ckpt)
+        #  Load Stage-1 model if available (优先级高于resume_ckpt)
         # Skip Stage-1 loading in eval-only mode to allow loading specified checkpoint
         if load_stage1_model and not args.eval_only:
             print(f"📥 Loading Stage-1 SL-only model...")
             try:
                 saver.restore(sess, stage1_model_path)
-                print(f"✅ Successfully loaded Stage-1 model from {stage1_model_path}")
-                print(f"🚀 Will start training from Phase-2 (SL+RL joint training)")
+                print(f" Successfully loaded Stage-1 model from {stage1_model_path}")
+                print(f" Will start training from Phase-2 (SL+RL joint training)")
                 
-                # 🔥 Pre-collect O-buffer with SL head (performance optimization: save/load)
+                #  Pre-collect O-buffer with SL head (performance optimization: save/load)
                 # 优先使用用户指定的路径，否则自动查找
                 if args.precollected_obuffer_path and args.precollected_obuffer_path != 'precollected_obuffer_sl.df':
                     # 用户指定了自定义路径
@@ -1656,7 +1791,7 @@ if __name__ == '__main__':
                     if precollected_obuffer_file is None:
                         # 回退到旧路径（向后兼容）
                         precollected_obuffer_file = os.path.join(data_directory, args.precollected_obuffer_path)
-                # 🔥 确保参数是数字，避免tuple/float比较错误
+                #  确保参数是数字，避免tuple/float比较错误
                 onpolicy_buffer_size = args.onpolicy_buffer_size
                 # 处理precollect_buffer_ratio（可能是tuple或float）
                 if isinstance(args.precollect_buffer_ratio, (tuple, list)):
@@ -1673,37 +1808,37 @@ if __name__ == '__main__':
                 checkpoint_file = precollected_obuffer_file.replace('.df', '_checkpoint.df')
                 
                 if os.path.exists(precollected_obuffer_file):
-                    print(f"\n🔥 Loading pre-collected O-buffer from {precollected_obuffer_file}...")
+                    print(f"\n Loading pre-collected O-buffer from {precollected_obuffer_file}...")
                     load_success = onpolicy_buffer.load_from_file(precollected_obuffer_file, max_size=onpolicy_buffer_size)
                     
                     if load_success and onpolicy_buffer.size() >= precollect_target_size * 0.9:  # Allow 10% tolerance
-                        print(f"✅ Pre-collected O-buffer loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
+                        print(f" Pre-collected O-buffer loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
                         snapshot = onpolicy_buffer.get_composition_snapshot()
                         print(f"   Success ratio: {snapshot['success_ratio']:.2%}")
                         print(f"   Termination types: {snapshot['termination_types']}")
                     else:
-                        print(f"⚠️  Pre-collected file exists but size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), trying checkpoint...")
+                        print(f"  Pre-collected file exists but size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), trying checkpoint...")
                         load_success = False
                 elif os.path.exists(checkpoint_file):
-                    print(f"\n🔥 Pre-collected O-buffer not found, but checkpoint exists: {checkpoint_file}")
+                    print(f"\n Pre-collected O-buffer not found, but checkpoint exists: {checkpoint_file}")
                     print(f"   Loading checkpoint...")
                     load_success = onpolicy_buffer.load_from_file(checkpoint_file, max_size=onpolicy_buffer_size)
                     
                     if load_success and onpolicy_buffer.size() >= precollect_target_size * 0.5:  # Checkpoint only needs 50%
-                        print(f"✅ Checkpoint loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
+                        print(f" Checkpoint loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
                         print(f"   Will continue from where it left off...")
                         snapshot = onpolicy_buffer.get_composition_snapshot()
                         print(f"   Success ratio: {snapshot['success_ratio']:.2%}")
                         print(f"   Termination types: {snapshot['termination_types']}")
                     else:
-                        print(f"⚠️  Checkpoint size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), re-collecting...")
+                        print(f"  Checkpoint size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), re-collecting...")
                         onpolicy_buffer.buffer = []
                         onpolicy_buffer.position = 0
                         onpolicy_buffer.edge_usage_count = {}
                         load_success = False
                 else:
                     load_success = False
-                    print(f"\n🔥 Pre-collected O-buffer not found at {precollected_obuffer_file}")
+                    print(f"\n Pre-collected O-buffer not found at {precollected_obuffer_file}")
                     print(f"   Checkpoint not found at {checkpoint_file}")
                     print(f"   Will collect new O-buffer with SL head...")
                 
@@ -1714,31 +1849,31 @@ if __name__ == '__main__':
                 
                 # If loading failed or file doesn't exist, perform pre-collection
                 if not load_success:
-                    # 🔥 使用统一的预收集函数，避免代码重复
+                    #  使用统一的预收集函数，避免代码重复
                     precollect_success = precollect_obuffer_at_phase2_transition(
                         sess, QN_1, onpolicy_buffer, data_directory, args, args.user_id, args.moe_data_dir,
                         G, edge_id_map, item_num, reward_goal, state_size, feature_dim, model_feature_dim,
                         text_embedding_loader, embedding_proj_weights, embedding_proj_biases,
                         precollected_obuffer_file=precollected_obuffer_file,
-                        replay_buffer=replay_buffer,  # 🔥 传递已采样的replay_buffer
+                        replay_buffer=replay_buffer,  #  传递已采样的replay_buffer
                         user_id_for_model=None,
                         user_embedding=user_embedding if args.use_user_embedding else None,
                         user_embeddings_dict=user_embeddings_dict if args.use_user_embedding else None
                     )
                     if not precollect_success:
-                        print(f"   ⚠️  Pre-collection failed, will collect during training")
+                        print(f"     Pre-collection failed, will collect during training")
                 
-                # 🔥 加载模型后进行初始评估
+                #  加载模型后进行初始评估
                 print(f"\n🔍 Evaluating loaded Stage-1 model...")
-                # 🔥 确保global_step是整数，避免tuple/float比较错误
+                #  确保global_step是整数，避免tuple/float比较错误
                 current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, load_stage1_model)
-                print(f"📊 Current Phase: {phase_name} (Step {global_step})")
+                print(f" Current Phase: {phase_name} (Step {global_step})")
                 
             except Exception as e:
-                print(f"❌ Failed to load Stage-1 model: {e}")
+                print(f" Failed to load Stage-1 model: {e}")
                 print(f"   Will start training from scratch...")
                 load_stage1_model = False
-                global_step = 0  # 🔥 重置global_step
+                global_step = 0  #  重置global_step
                 
         elif resume_ckpt is not None and os.path.exists(resume_ckpt + ".index"):
             print(f"Restoring model from checkpoint: {resume_ckpt}")
@@ -1758,11 +1893,11 @@ if __name__ == '__main__':
                 else:
                     print("Could not infer global_step from checkpoint name, starting from 0.")
             
-            # 🔥 修复：加载checkpoint后，检查模型期望的特征维度
+            #  修复：加载checkpoint后，检查模型期望的特征维度
             # 如果模型期望增强特征（143维），但text_embedding_loader未初始化，强制初始化
             model_expects_enhanced = QN_1.feature_dim > feature_dim
             if model_expects_enhanced and text_embedding_loader is None:
-                print(f"\n⚠️  WARNING: Loaded model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
+                print(f"\n  WARNING: Loaded model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
                 print(f"   Attempting to initialize text embedding loader...")
                 if args.text_embedding_cache_dir and os.path.exists(args.text_embedding_cache_dir):
                     try:
@@ -1772,7 +1907,7 @@ if __name__ == '__main__':
                             readonly=True,
                             preload_all=True
                         )
-                        print(f"✅ Text embedding loader initialized from {args.text_embedding_cache_dir}")
+                        print(f" Text embedding loader initialized from {args.text_embedding_cache_dir}")
                         
                         # 初始化投影权重（使用随机初始化，实际权重应该从checkpoint加载）
                         if embedding_proj_weights is None:
@@ -1805,9 +1940,9 @@ if __name__ == '__main__':
                         args.use_edge_embedding = True
                         args.use_node_embedding = True
                         args.use_goal_embedding = True
-                        print(f"   ✅ Forced enable text embeddings for evaluation")
+                        print(f"    Forced enable text embeddings for evaluation")
                     except Exception as e:
-                        print(f"❌ Failed to initialize text embedding loader: {e}")
+                        print(f" Failed to initialize text embedding loader: {e}")
                         raise RuntimeError(
                             f"Model expects feature_dim={QN_1.feature_dim} (enhanced), but cannot initialize text_embedding_loader. "
                             f"Please provide --text_embedding_cache_dir or ensure the model was trained with text embeddings."
@@ -1819,7 +1954,7 @@ if __name__ == '__main__':
                         f"Please provide --text_embedding_cache_dir=<path_to_text_embeddings>."
                     )
             elif model_expects_enhanced and text_embedding_loader is not None:
-                print(f"✅ Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
+                print(f" Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
         elif args.eval_only and resume_ckpt is not None and os.path.exists(resume_ckpt + ".index"):
             # Eval-only mode: Load the checkpoint we determined earlier
             print(f"🔍 Eval-only mode: Loading checkpoint: {resume_ckpt}")
@@ -1836,12 +1971,12 @@ if __name__ == '__main__':
                 else:
                     # Default to phase2 start step if can't infer
                     global_step = args.phase1_sl_only_steps
-            print(f"✅ Checkpoint loaded, inferred global_step={global_step}")
+            print(f" Checkpoint loaded, inferred global_step={global_step}")
             
-            # 🔥 修复：加载checkpoint后，检查模型期望的特征维度
+            #  修复：加载checkpoint后，检查模型期望的特征维度
             model_expects_enhanced = QN_1.feature_dim > feature_dim
             if model_expects_enhanced and text_embedding_loader is None:
-                print(f"\n⚠️  WARNING: Loaded model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
+                print(f"\n  WARNING: Loaded model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
                 print(f"   Attempting to initialize text embedding loader...")
                 if args.text_embedding_cache_dir and os.path.exists(args.text_embedding_cache_dir):
                     try:
@@ -1851,7 +1986,7 @@ if __name__ == '__main__':
                             readonly=True,
                             preload_all=True
                         )
-                        print(f"✅ Text embedding loader initialized from {args.text_embedding_cache_dir}")
+                        print(f" Text embedding loader initialized from {args.text_embedding_cache_dir}")
                         
                         # 初始化投影权重
                         if embedding_proj_weights is None:
@@ -1883,9 +2018,9 @@ if __name__ == '__main__':
                         args.use_edge_embedding = True
                         args.use_node_embedding = True
                         args.use_goal_embedding = True
-                        print(f"   ✅ Forced enable text embeddings for evaluation")
+                        print(f"    Forced enable text embeddings for evaluation")
                     except Exception as e:
-                        print(f"❌ Failed to initialize text embedding loader: {e}")
+                        print(f" Failed to initialize text embedding loader: {e}")
                         raise RuntimeError(
                             f"Model expects feature_dim={QN_1.feature_dim} (enhanced), but cannot initialize text_embedding_loader. "
                             f"Please provide --text_embedding_cache_dir or ensure the model was trained with text embeddings."
@@ -1897,27 +2032,27 @@ if __name__ == '__main__':
                         f"Please provide --text_embedding_cache_dir=<path_to_text_embeddings>."
                     )
             elif model_expects_enhanced and text_embedding_loader is not None:
-                print(f"✅ Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
+                print(f" Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
         elif args.eval_only:
-            raise RuntimeError(f"❌ Eval-only mode: No valid checkpoint to load: {resume_ckpt}")
+            raise RuntimeError(f" Eval-only mode: No valid checkpoint to load: {resume_ckpt}")
         else:
             print("No checkpoint loaded, training from scratch.")
 
         num_rows=replay_buffer.shape[0]
         num_batches=int(num_rows/args.batch_size)
         
-        # 🔥 计算 Phase-1 的总步数（基于epoch数）
+        #  计算 Phase-1 的总步数（基于epoch数）
         min_sl_steps = 1000
         steps_per_epoch = num_batches
         args.phase1_sl_only_steps = max(min_sl_steps, args.phase1_epochs * steps_per_epoch)
-        print(f"📊 Calculated phase1_sl_only_steps = max({min_sl_steps}, {args.phase1_epochs} epochs × {steps_per_epoch} steps/epoch) = {args.phase1_sl_only_steps} steps")
+        print(f" Calculated phase1_sl_only_steps = max({min_sl_steps}, {args.phase1_epochs} epochs × {steps_per_epoch} steps/epoch) = {args.phase1_sl_only_steps} steps")
         
-        # 🔥 根据 epoch-based 参数自动计算 step-based 的 log_frequency 和 eval_frequency
+        #  根据 epoch-based 参数自动计算 step-based 的 log_frequency 和 eval_frequency
         # 这样不同 data ratio 下，用户只需设置相同的 epoch 参数，就能保证一致的评估频率
         args.log_frequency = max(1, int(args.log_frequency_epoch * steps_per_epoch))
         args.eval_frequency = max(1, int(args.eval_frequency_epoch * steps_per_epoch))
-        print(f"📊 Calculated log_frequency = {args.log_frequency_epoch} epochs x {steps_per_epoch} steps/epoch = {args.log_frequency} steps")
-        print(f"📊 Calculated eval_frequency = {args.eval_frequency_epoch} epochs x {steps_per_epoch} steps/epoch = {args.eval_frequency} steps")
+        print(f" Calculated log_frequency = {args.log_frequency_epoch} epochs x {steps_per_epoch} steps/epoch = {args.log_frequency} steps")
+        print(f" Calculated eval_frequency = {args.eval_frequency_epoch} epochs x {steps_per_epoch} steps/epoch = {args.eval_frequency} steps")
         
         # Initial evaluation
         if not args.skip_initial_eval:
@@ -1925,11 +2060,11 @@ if __name__ == '__main__':
             print("INITIAL EVALUATION (Before Training)")
             print("="*60)
             
-            # 🔥 修复：检查模型期望的特征维度，如果模型期望增强特征，必须提供text_embedding_loader
+            #  修复：检查模型期望的特征维度，如果模型期望增强特征，必须提供text_embedding_loader
             model_expects_enhanced = QN_1.feature_dim > feature_dim
             if model_expects_enhanced:
                 if text_embedding_loader is None:
-                    print(f"⚠️  WARNING: Model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
+                    print(f"  WARNING: Model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
                     print(f"   Attempting to initialize text embedding loader from checkpoint or args...")
                     # 尝试从checkpoint加载投影权重，或者使用默认配置初始化
                     if args.text_embedding_cache_dir and os.path.exists(args.text_embedding_cache_dir):
@@ -1939,7 +2074,7 @@ if __name__ == '__main__':
                                 cache_dir=args.text_embedding_cache_dir,
                                 preload_all=True
                             )
-                            print(f"✅ Text embedding loader initialized from {args.text_embedding_cache_dir}")
+                            print(f" Text embedding loader initialized from {args.text_embedding_cache_dir}")
                             
                             # 初始化投影权重（使用随机初始化，实际权重应该从checkpoint加载）
                             embedding_proj_weights = {}
@@ -1968,9 +2103,9 @@ if __name__ == '__main__':
                             args.use_edge_embedding = True
                             args.use_node_embedding = True
                             args.use_goal_embedding = True
-                            print(f"   ✅ Forced enable text embeddings for evaluation")
+                            print(f"    Forced enable text embeddings for evaluation")
                         except Exception as e:
-                            print(f"❌ Failed to initialize text embedding loader: {e}")
+                            print(f" Failed to initialize text embedding loader: {e}")
                             raise RuntimeError(
                                 f"Model expects feature_dim={QN_1.feature_dim} (enhanced), but cannot initialize text_embedding_loader. "
                                 f"Please provide --text_embedding_cache_dir or ensure the model was trained with text embeddings."
@@ -1981,16 +2116,16 @@ if __name__ == '__main__':
                             f"--text_embedding_cache_dir is not provided. Please provide --text_embedding_cache_dir."
                         )
                 else:
-                    print(f"✅ Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
+                    print(f" Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
             
-            # 🔥 根据是否加载Stage-1模型确定评估参数
+            #  根据是否加载Stage-1模型确定评估参数
             if load_stage1_model:
                 # 加载了Stage-1模型，使用Phase-2参数进行评估
                 current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, load_stage1_model)
-                print(f"📊 Evaluating loaded Stage-1 model with Phase-2 parameters:")
+                print(f" Evaluating loaded Stage-1 model with Phase-2 parameters:")
                 print(f"   Phase: {phase_name}, RL Weight: {rl_weight}, LR: {current_lr}")
-                # 🔥 使用test集进行初始评估，显示完整的新评估指标（A.单步准确率, B.Reach@B, C.路径准确率/覆盖度）
-                print(f"\n🔥 Using TEST dataset for initial evaluation to show complete metrics...")
+                #  使用test集进行初始评估，显示完整的新评估指标（A.单步准确率, B.Reach@B, C.路径准确率/覆盖度）
+                print(f"\n Using TEST dataset for initial evaluation to show complete metrics...")
                 batch_evaluate_improved(sess, QN_1, dataset='test', logger=logger, step=global_step, 
                                       training_phase=current_phase, rl_weight=rl_weight, 
                                       batch_size=args.batch_size, sample_ratio=1.0,  # 使用全量test集
@@ -2002,9 +2137,9 @@ if __name__ == '__main__':
                                       data_directory=data_directory, user_id=args.user_id, moe_data_dir=args.moe_data_dir, graph_id=args.graph_id)
             else:
                 # 从头开始训练，使用Phase-1参数进行评估
-                print(f"📊 Evaluating fresh model with Phase-1 parameters:")
-                # 🔥 使用test集进行初始评估
-                print(f"\n🔥 Using TEST dataset for initial evaluation to show complete metrics...")
+                print(f" Evaluating fresh model with Phase-1 parameters:")
+                #  使用test集进行初始评估
+                print(f"\n Using TEST dataset for initial evaluation to show complete metrics...")
                 batch_evaluate_improved(sess, QN_1, dataset='test', logger=logger, step=global_step, 
                                       training_phase=1, rl_weight=0.0, 
                                       batch_size=args.batch_size, sample_ratio=1.0,  # 使用全量test集
@@ -2019,17 +2154,17 @@ if __name__ == '__main__':
             print("\n" + "="*60)
             print("SKIPPING INITIAL EVALUATION (--skip_initial_eval flag set)")
             print("="*60 + "\n")
-            # 🔥 即使跳过评估，也需要确定训练阶段的参数（用于后续训练）
+            #  即使跳过评估，也需要确定训练阶段的参数（用于后续训练）
             if load_stage1_model:
                 current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, load_stage1_model)
             else:
                 current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, False)
-            print(f"📊 Starting training from: {phase_name} (Step {global_step})")
-            print(f"⚙️ RL Weight: {rl_weight}, Learning Rate: {current_lr}")
+            print(f" Starting training from: {phase_name} (Step {global_step})")
+            print(f" RL Weight: {rl_weight}, Learning Rate: {current_lr}")
             
-            # 🔥 如果已经进入 Phase-2 但没有执行预收集（从 checkpoint 恢复或 Stage-1 模型不存在），也需要执行预收集
+            #  如果已经进入 Phase-2 但没有执行预收集（从 checkpoint 恢复或 Stage-1 模型不存在），也需要执行预收集
             if current_phase >= 2 and not load_stage1_model:
-                print(f"\n🔥 Detected Phase-2 training (step {global_step} >= {args.phase1_sl_only_steps})")
+                print(f"\n Detected Phase-2 training (step {global_step} >= {args.phase1_sl_only_steps})")
                 print(f"   Checking pre-collected O-buffer...")
                 
                 # 执行预收集逻辑（复用 Stage-1 加载时的逻辑）
@@ -2048,53 +2183,53 @@ if __name__ == '__main__':
                 load_success = False
                 
                 if os.path.exists(precollected_obuffer_file):
-                    print(f"   🔥 Loading pre-collected O-buffer from {precollected_obuffer_file}...")
+                    print(f"    Loading pre-collected O-buffer from {precollected_obuffer_file}...")
                     load_success = onpolicy_buffer.load_from_file(precollected_obuffer_file, max_size=onpolicy_buffer_size)
                     if load_success and onpolicy_buffer.size() >= precollect_target_size * 0.9:
-                        print(f"   ✅ Pre-collected O-buffer loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
+                        print(f"    Pre-collected O-buffer loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
                     else:
-                        print(f"   ⚠️  File exists but size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), will re-collect")
+                        print(f"     File exists but size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), will re-collect")
                         load_success = False
                 elif os.path.exists(checkpoint_file):
-                    print(f"   🔥 Loading checkpoint: {checkpoint_file}")
+                    print(f"    Loading checkpoint: {checkpoint_file}")
                     load_success = onpolicy_buffer.load_from_file(checkpoint_file, max_size=onpolicy_buffer_size)
                     if load_success and onpolicy_buffer.size() >= precollect_target_size * 0.5:
-                        print(f"   ✅ Checkpoint loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
+                        print(f"    Checkpoint loaded: {onpolicy_buffer.size()}/{onpolicy_buffer_size} transitions")
                     else:
-                        print(f"   ⚠️  Checkpoint size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), will re-collect")
+                        print(f"     Checkpoint size insufficient ({onpolicy_buffer.size()}/{precollect_target_size}), will re-collect")
                         load_success = False
                 
                 if not load_success:
-                    print(f"   🔥 Pre-collected O-buffer not found or insufficient")
+                    print(f"    Pre-collected O-buffer not found or insufficient")
                     print(f"   Will collect new O-buffer with SL head...")
                     print(f"   Target: {precollect_target_size} transitions ({precollect_buffer_ratio*100:.0f}% of buffer = {onpolicy_buffer_size})")
                     print(f"   Current: {onpolicy_buffer.size()} transitions")
                     
-                    # 🔥 执行预收集（复用 Stage-1 加载时的逻辑）
+                    #  执行预收集（复用 Stage-1 加载时的逻辑）
                     # 注意：这里假设模型已经从 checkpoint 恢复，可以用于生成路径
                     try:
-                        # 🔥 从training data中提取所有唯一的起终点对（优先使用已加载的replay_buffer）
-                        print(f"   📊 Extracting unique start-end pairs from training data...")
+                        #  从training data中提取所有唯一的起终点对（优先使用已加载的replay_buffer）
+                        print(f"    Extracting unique start-end pairs from training data...")
                         
                         if replay_buffer is not None:
                             # 使用已加载的replay_buffer（可能已经采样过）
                             train_replay_buffer = replay_buffer
-                            print(f"   📊 Using provided replay_buffer ({len(train_replay_buffer)} transitions)")
+                            print(f"    Using provided replay_buffer ({len(train_replay_buffer)} transitions)")
                         else:
                             # 从文件读取（兼容旧代码）
                             train_replay_buffer_path = get_moe_data_path(data_directory, args.user_id, args.moe_data_dir, 'replay_buffer.df', args.graph_id)
                             if os.path.exists(train_replay_buffer_path):
                                 train_replay_buffer = pd.read_pickle(train_replay_buffer_path)
-                                print(f"   📊 Loaded replay_buffer from file ({len(train_replay_buffer)} transitions)")
+                                print(f"    Loaded replay_buffer from file ({len(train_replay_buffer)} transitions)")
                             else:
                                 train_replay_buffer = pd.read_pickle(os.path.join(data_directory, 'replay_buffer.df'))
-                                print(f"   📊 Loaded replay_buffer from standard path ({len(train_replay_buffer)} transitions)")
+                                print(f"    Loaded replay_buffer from standard path ({len(train_replay_buffer)} transitions)")
                         
                         start_end_pairs = set()
                         for _, row in train_replay_buffer.iterrows():
                             action = row['action']
                             if len(action) >= 15:
-                                # 🔥 修复：使用固定索引，而不是负索引
+                                #  修复：使用固定索引，而不是负索引
                                 # origin_x, origin_y 在索引 9, 10
                                 # dest_x, dest_y 在索引 11, 12
                                 start_x, start_y = float(action[9]), float(action[10])
@@ -2102,7 +2237,7 @@ if __name__ == '__main__':
                                 start_end_pairs.add(((start_x, start_y), (end_x, end_y)))
                         
                         start_end_pairs = list(start_end_pairs)
-                        print(f"   ✅ Found {len(start_end_pairs)} unique start-end pairs from training data")
+                        print(f"    Found {len(start_end_pairs)} unique start-end pairs from training data")
                         
                         # 临时放宽duplicate限制
                         original_max_duplicate = onpolicy_buffer.max_duplicate_per_edge
@@ -2123,16 +2258,16 @@ if __name__ == '__main__':
                                 break
                             
                             try:
-                                # 🔥 修复：ALWAYS构建正确的初始状态，不要从replay buffer中取
+                                #  修复：ALWAYS构建正确的初始状态，不要从replay buffer中取
                                 # replay buffer中的state可能是mid-trajectory状态，不是initial state
                                 from utils.utility import pad_history
                                 
                                 # 构建初始状态（与build_path_data_for_batch格式一致）
-                                cur_x, cur_y = start_pos[0], start_pos[1]  # 🔥 当前位置 = 起始位置
+                                cur_x, cur_y = start_pos[0], start_pos[1]  #  当前位置 = 起始位置
                                 initial_state_frame = [0.0] * 9 + [start_pos[0], start_pos[1], end_pos[0], end_pos[1], cur_x, cur_y]
-                                start_state = np.array(pad_history([initial_state_frame], state_size, [0.0] * 15))  # 🔥 Convert entire padded history
+                                start_state = np.array(pad_history([initial_state_frame], state_size, [0.0] * 15))  #  Convert entire padded history
                                 
-                                # 🔥 如果启用了文本 embeddings，需要增强 start_state
+                                #  如果启用了文本 embeddings，需要增强 start_state
                                 if args.use_text_embeddings and text_embedding_loader is not None:
                                     # 检查 start_state 的维度
                                     if isinstance(start_state, np.ndarray) and start_state.ndim == 2:
@@ -2149,14 +2284,14 @@ if __name__ == '__main__':
                                                 user_embeddings_dict=user_embeddings_dict if args.use_user_embedding else None
                                             )[0]
                                         elif state_feature_dim != model_feature_dim:
-                                            print(f"   ⚠️  [Pair {pair_idx}] State feature_dim mismatch: {state_feature_dim} != {model_feature_dim}")
+                                            print(f"     [Pair {pair_idx}] State feature_dim mismatch: {state_feature_dim} != {model_feature_dim}")
                                 elif args.use_user_embedding and user_embedding is not None:
                                     # 如果只启用了用户embedding，没有文本embedding
                                     start_state = add_user_embedding_to_states(np.array([start_state]), user_embedding)[0]
                                 elif model_feature_dim != feature_dim:
-                                    # 🔥 模型期望增强后的特征，但text embeddings未启用
+                                    #  模型期望增强后的特征，但text embeddings未启用
                                     if pair_idx < 3:
-                                        print(f"   ❌ [Pair {pair_idx}] Model expects feature_dim={model_feature_dim}, but text embeddings disabled (feature_dim={feature_dim})")
+                                        print(f"    [Pair {pair_idx}] Model expects feature_dim={model_feature_dim}, but text embeddings disabled (feature_dim={feature_dim})")
                                     raise ValueError(f"Model expects feature_dim={model_feature_dim}, but text embeddings are disabled (feature_dim={feature_dim}). "
                                                     f"Please enable text embeddings with --use_text_embeddings or retrain the model without text embeddings.")
                                 
@@ -2168,8 +2303,8 @@ if __name__ == '__main__':
                                     text_embedding_loader=text_embedding_loader,
                                     embedding_proj_weights=embedding_proj_weights,
                                     embedding_proj_biases=embedding_proj_biases,
-                                    user_id_for_model=None,  # 🔥 在训练阶段，使用None（非个性化模型）
-                                    user_embedding=user_embedding  # 🔥 传递user_embedding
+                                    user_id_for_model=None,  #  在训练阶段，使用None（非个性化模型）
+                                    user_embedding=user_embedding  #  传递user_embedding
                                 )
                                 
                                 if len(predicted_path) < 1:
@@ -2227,12 +2362,12 @@ if __name__ == '__main__':
                             except Exception as e:
                                 failed_paths += 1
                                 if (pair_idx + 1) % 100 == 0:
-                                    print(f"   ⚠️  Error at pair {pair_idx}: {e}")
+                                    print(f"     Error at pair {pair_idx}: {e}")
                                 continue
                         
                         # 恢复duplicate限制并保存
                         onpolicy_buffer.max_duplicate_per_edge = original_max_duplicate
-                        print(f"\n   ✅ Pre-collection complete!")
+                        print(f"\n    Pre-collection complete!")
                         print(f"      Processed: {successful_paths + failed_paths}/{len(start_end_pairs)} pairs")
                         print(f"      Buffer size: {onpolicy_buffer.size()}/{precollect_target_size} transitions")
                         print(f"      Success: {successful_paths}, Failed: {failed_paths}")
@@ -2244,7 +2379,7 @@ if __name__ == '__main__':
                             onpolicy_buffer.save_to_file(new_precollected_path)
                             print(f"      💾 Saved to {new_precollected_path}")
                         except Exception as e:
-                            print(f"      ⚠️  Failed to save: {e}")
+                            print(f"        Failed to save: {e}")
                             try:
                                 checkpoint_file = precollected_obuffer_file.replace('.df', '_checkpoint.df')
                                 onpolicy_buffer.save_to_file(checkpoint_file)
@@ -2253,23 +2388,23 @@ if __name__ == '__main__':
                                 pass
                         print()
                     except Exception as e:
-                        print(f"   ❌ Pre-collection failed: {e}")
+                        print(f"    Pre-collection failed: {e}")
                         import traceback
                         traceback.print_exc()
-                        print(f"   ⚠️  Will continue training without pre-collected buffer")
+                        print(f"     Will continue training without pre-collected buffer")
                         print()
 
-        # 🔥 Eval-only mode: Skip training and go directly to final evaluation
+        #  Eval-only mode: Skip training and go directly to final evaluation
         if args.eval_only:
             print("\n" + "="*60)
             print("EVAL-ONLY MODE: Skipping training, proceeding to final evaluation")
             print("="*60)
             
-            # 🔥 修复：检查模型期望的特征维度，如果模型期望增强特征，必须提供text_embedding_loader
+            #  修复：检查模型期望的特征维度，如果模型期望增强特征，必须提供text_embedding_loader
             model_expects_enhanced = QN_1.feature_dim > feature_dim
             if model_expects_enhanced:
                 if text_embedding_loader is None:
-                    print(f"⚠️  WARNING: Model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
+                    print(f"  WARNING: Model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
                     print(f"   Attempting to initialize text embedding loader from checkpoint or args...")
                     # 尝试从checkpoint加载投影权重，或者使用默认配置初始化
                     if args.text_embedding_cache_dir and os.path.exists(args.text_embedding_cache_dir):
@@ -2279,7 +2414,7 @@ if __name__ == '__main__':
                                 cache_dir=args.text_embedding_cache_dir,
                                 preload_all=True
                             )
-                            print(f"✅ Text embedding loader initialized from {args.text_embedding_cache_dir}")
+                            print(f" Text embedding loader initialized from {args.text_embedding_cache_dir}")
                             
                             # 初始化投影权重（使用随机初始化，实际权重应该从checkpoint加载）
                             embedding_proj_weights = {}
@@ -2308,9 +2443,9 @@ if __name__ == '__main__':
                             args.use_edge_embedding = True
                             args.use_node_embedding = True
                             args.use_goal_embedding = True
-                            print(f"   ✅ Forced enable text embeddings for evaluation")
+                            print(f"    Forced enable text embeddings for evaluation")
                         except Exception as e:
-                            print(f"❌ Failed to initialize text embedding loader: {e}")
+                            print(f" Failed to initialize text embedding loader: {e}")
                             raise RuntimeError(
                                 f"Model expects feature_dim={QN_1.feature_dim} (enhanced), but cannot initialize text_embedding_loader. "
                                 f"Please provide --text_embedding_cache_dir or ensure the model was trained with text embeddings."
@@ -2321,7 +2456,7 @@ if __name__ == '__main__':
                             f"--text_embedding_cache_dir is not provided. Please provide --text_embedding_cache_dir."
                         )
                 else:
-                    print(f"✅ Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
+                    print(f" Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
             
             # Ensure model is loaded
             if resume_ckpt is not None and os.path.exists(resume_ckpt + ".index"):
@@ -2341,17 +2476,17 @@ if __name__ == '__main__':
                         else:
                             # Default to phase2 start step if can't infer
                             global_step = args.phase1_sl_only_steps
-                    print(f"✅ Checkpoint loaded, inferred global_step={global_step}")
+                    print(f" Checkpoint loaded, inferred global_step={global_step}")
             elif load_stage1_model and os.path.exists(stage1_model_path + '.meta'):
-                print(f"✅ Using already loaded Stage-1 model for evaluation")
+                print(f" Using already loaded Stage-1 model for evaluation")
             else:
-                raise RuntimeError("❌ Eval-only mode requires a loaded checkpoint. Please provide --resume_ckpt or ensure checkpoint exists.")
+                raise RuntimeError(" Eval-only mode requires a loaded checkpoint. Please provide --resume_ckpt or ensure checkpoint exists.")
             
-            # 🔥 修复：在加载checkpoint后，检查模型期望的特征维度
+            #  修复：在加载checkpoint后，检查模型期望的特征维度
             model_expects_enhanced = QN_1.feature_dim > feature_dim
             if model_expects_enhanced:
                 if text_embedding_loader is None:
-                    print(f"⚠️  WARNING: Model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
+                    print(f"  WARNING: Model expects feature_dim={QN_1.feature_dim} (enhanced), but text_embedding_loader is None.")
                     print(f"   Attempting to initialize text embedding loader from checkpoint or args...")
                     # 尝试从checkpoint加载投影权重，或者使用默认配置初始化
                     if args.text_embedding_cache_dir and os.path.exists(args.text_embedding_cache_dir):
@@ -2361,7 +2496,7 @@ if __name__ == '__main__':
                                 cache_dir=args.text_embedding_cache_dir,
                                 preload_all=True
                             )
-                            print(f"✅ Text embedding loader initialized from {args.text_embedding_cache_dir}")
+                            print(f" Text embedding loader initialized from {args.text_embedding_cache_dir}")
                             
                             # 初始化投影权重（使用随机初始化，实际权重应该从checkpoint加载）
                             embedding_proj_weights = {}
@@ -2390,9 +2525,9 @@ if __name__ == '__main__':
                             args.use_edge_embedding = True
                             args.use_node_embedding = True
                             args.use_goal_embedding = True
-                            print(f"   ✅ Forced enable text embeddings for evaluation")
+                            print(f"    Forced enable text embeddings for evaluation")
                         except Exception as e:
-                            print(f"❌ Failed to initialize text embedding loader: {e}")
+                            print(f" Failed to initialize text embedding loader: {e}")
                             raise RuntimeError(
                                 f"Model expects feature_dim={QN_1.feature_dim} (enhanced), but cannot initialize text_embedding_loader. "
                                 f"Please provide --text_embedding_cache_dir or ensure the model was trained with text embeddings."
@@ -2403,11 +2538,11 @@ if __name__ == '__main__':
                             f"--text_embedding_cache_dir is not provided. Please provide --text_embedding_cache_dir."
                         )
                 else:
-                    print(f"✅ Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
+                    print(f" Model expects enhanced features (dim={QN_1.feature_dim}), text_embedding_loader is available")
             
             # Determine current phase for evaluation
             current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, load_stage1_model)
-            print(f"📊 Evaluation will use: Phase={phase_name}, RL Weight={rl_weight}, LR={current_lr}")
+            print(f" Evaluation will use: Phase={phase_name}, RL Weight={rl_weight}, LR={current_lr}")
             print("="*60 + "\n")
             
             # Skip to final evaluation (will be executed after the training loop block)
@@ -2417,19 +2552,19 @@ if __name__ == '__main__':
             # Initialize training phase variables
             current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, load_stage1_model)
             
-            # 🔥 标志：确保Stage-1消息只打印一次
+            #  标志：确保Stage-1消息只打印一次
             stage1_message_printed = False
             
-            # 🔥 初始化：用于追踪step之间的时间间隔
+            #  初始化：用于追踪step之间的时间间隔
             t_step_end_prev = None
             step_total_time_prev = None
             
-            # 🔥 记录训练开始时的 global_step，用于计算训练循环内的实际步数
+            #  记录训练开始时的 global_step，用于计算训练循环内的实际步数
             training_start_step = global_step
-            print(f"📊 Training will start from step {training_start_step:,}")
+            print(f" Training will start from step {training_start_step:,}")
             print("="*60 + "\n")
             
-            # 🔥 Early stopping initialization
+            #  Early stopping initialization
             best_val_metric = -float('inf')  # Best validation metric value
             patience_counter = 0  # Number of evaluations without improvement
             best_model_step = 0  # Step where best model was found
@@ -2437,7 +2572,7 @@ if __name__ == '__main__':
             early_stop_triggered = False  # Flag to indicate if early stopping was triggered
             
             if args.early_stopping:
-                print(f"🛑 Early Stopping Enabled:")
+                print(f"  Early Stopping Enabled:")
                 print(f"   Metric: {args.early_stopping_metric}")
                 print(f"   Patience: {args.early_stopping_patience} evaluations (~{args.early_stopping_patience * args.eval_frequency_epoch:.1f} epochs)")
                 print(f"   Min Delta: {args.early_stopping_min_delta}")
@@ -2446,24 +2581,24 @@ if __name__ == '__main__':
             
             for i in range(args.epoch):
                 for j in range(num_batches):
-                    # 🔥 Stage-1: Save SL-only model at specified steps (only if not already loaded)
+                    #  Stage-1: Save SL-only model at specified steps (only if not already loaded)
                     if (args.stage1_save_model and 
                         global_step == args.phase1_sl_only_steps and
                         not load_stage1_model and
-                        not stage1_message_printed):  # 🔥 如果已经加载了Stage-1模型，跳过保存
+                        not stage1_message_printed):  #  如果已经加载了Stage-1模型，跳过保存
                         print(f"\n💾 Saving Stage-1 SL-only model at step {global_step}...")
                         # 使用新的路径组织方式（按阶段和用户）
                         new_stage1_path = get_stage1_model_path(data_directory, args.user_id, global_step)
                         saver.save(sess, new_stage1_path)
-                        print(f"✅ Stage-1 model saved to {new_stage1_path}")
-                        print(f"🎯 Stage-1 SL-only training completed!")
-                        # 🔥 Phase-2训练：随机起终点模式
-                        print(f"🚀 Ready for Phase-2 Random Start-End RL training...")
+                        print(f" Stage-1 model saved to {new_stage1_path}")
+                        print(f" Stage-1 SL-only training completed!")
+                        #  Phase-2训练：随机起终点模式
+                        print(f" Ready for Phase-2 Random Start-End RL training...")
                         stage1_message_printed = True
                         
-                        # 🔥 修复：在Phase-2开始时检查并触发预收集O-buffer
+                        #  修复：在Phase-2开始时检查并触发预收集O-buffer
                         if onpolicy_buffer.size() < args.onpolicy_buffer_size * 0.1:  # 如果O-buffer几乎为空
-                            print(f"\n🔥 Phase-2 transition detected: Checking O-buffer pre-collection...")
+                            print(f"\n Phase-2 transition detected: Checking O-buffer pre-collection...")
                             print(f"   Current O-buffer size: {onpolicy_buffer.size()}/{args.onpolicy_buffer_size}")
                             
                             # 尝试加载预收集文件
@@ -2471,12 +2606,12 @@ if __name__ == '__main__':
                             load_success = False
                             
                             if os.path.exists(precollected_obuffer_file):
-                                print(f"   📂 Found pre-collected O-buffer: {precollected_obuffer_file}")
+                                print(f"    Found pre-collected O-buffer: {precollected_obuffer_file}")
                                 load_success = onpolicy_buffer.load_from_file(precollected_obuffer_file, max_size=args.onpolicy_buffer_size)
                                 if load_success:
-                                    print(f"   ✅ Loaded {onpolicy_buffer.size()}/{args.onpolicy_buffer_size} transitions")
+                                    print(f"    Loaded {onpolicy_buffer.size()}/{args.onpolicy_buffer_size} transitions")
                                 else:
-                                    print(f"   ⚠️  Failed to load pre-collected O-buffer")
+                                    print(f"     Failed to load pre-collected O-buffer")
                             
                             # 如果加载失败或文件不存在，执行预收集
                             if not load_success:
@@ -2485,27 +2620,27 @@ if __name__ == '__main__':
                                     G, edge_id_map, item_num, reward_goal, state_size, feature_dim, model_feature_dim,
                                     text_embedding_loader, embedding_proj_weights, embedding_proj_biases,
                                     precollected_obuffer_file=precollected_obuffer_file,
-                                    replay_buffer=replay_buffer,  # 🔥 传递已采样的replay_buffer
+                                    replay_buffer=replay_buffer,  #  传递已采样的replay_buffer
                                     user_id_for_model=None,
                                     user_embedding=user_embedding if args.use_user_embedding else None,
                                     user_embeddings_dict=user_embeddings_dict if args.use_user_embedding else None
                                 )
                                 if not precollect_success:
-                                    print(f"   ⚠️  Pre-collection failed, will collect during training")
+                                    print(f"     Pre-collection failed, will collect during training")
                         
                         # 继续训练，不退出
                     elif (args.stage1_save_model and 
                           global_step == args.phase1_sl_only_steps and
                           load_stage1_model and
-                          not stage1_message_printed):  # 🔥 如果已经加载了Stage-1模型，只打印一次
-                        print(f"\n🎯 Stage-1 model already loaded, skipping save and continuing to Phase-2...")
-                        # 🔥 Phase-2训练：随机起终点模式
-                        print(f"🚀 Ready for Phase-2 Random Start-End RL training...")
+                          not stage1_message_printed):  #  如果已经加载了Stage-1模型，只打印一次
+                        print(f"\n Stage-1 model already loaded, skipping save and continuing to Phase-2...")
+                        #  Phase-2训练：随机起终点模式
+                        print(f" Ready for Phase-2 Random Start-End RL training...")
                         stage1_message_printed = True
                         
-                        # 🔥 修复：在Phase-2开始时检查并触发预收集O-buffer（与上面相同的逻辑）
+                        #  修复：在Phase-2开始时检查并触发预收集O-buffer（与上面相同的逻辑）
                         if onpolicy_buffer.size() < args.onpolicy_buffer_size * 0.1:  # 如果O-buffer几乎为空
-                            print(f"\n🔥 Phase-2 transition detected: Checking O-buffer pre-collection...")
+                            print(f"\n Phase-2 transition detected: Checking O-buffer pre-collection...")
                             print(f"   Current O-buffer size: {onpolicy_buffer.size()}/{args.onpolicy_buffer_size}")
                             
                             # 尝试加载预收集文件
@@ -2513,12 +2648,12 @@ if __name__ == '__main__':
                             load_success = False
                             
                             if os.path.exists(precollected_obuffer_file):
-                                print(f"   📂 Found pre-collected O-buffer: {precollected_obuffer_file}")
+                                print(f"    Found pre-collected O-buffer: {precollected_obuffer_file}")
                                 load_success = onpolicy_buffer.load_from_file(precollected_obuffer_file, max_size=args.onpolicy_buffer_size)
                                 if load_success:
-                                    print(f"   ✅ Loaded {onpolicy_buffer.size()}/{args.onpolicy_buffer_size} transitions")
+                                    print(f"    Loaded {onpolicy_buffer.size()}/{args.onpolicy_buffer_size} transitions")
                                 else:
-                                    print(f"   ⚠️  Failed to load pre-collected O-buffer")
+                                    print(f"     Failed to load pre-collected O-buffer")
                             
                             # 如果加载失败或文件不存在，执行预收集
                             if not load_success:
@@ -2527,19 +2662,19 @@ if __name__ == '__main__':
                                     G, edge_id_map, item_num, reward_goal, state_size, feature_dim, model_feature_dim,
                                     text_embedding_loader, embedding_proj_weights, embedding_proj_biases,
                                     precollected_obuffer_file=precollected_obuffer_file,
-                                    replay_buffer=replay_buffer,  # 🔥 传递已采样的replay_buffer
+                                    replay_buffer=replay_buffer,  #  传递已采样的replay_buffer
                                     user_id_for_model=None,
                                     user_embedding=user_embedding if args.use_user_embedding else None,
                                     user_embeddings_dict=user_embeddings_dict if args.use_user_embedding else None
                                 )
                                 if not precollect_success:
-                                    print(f"   ⚠️  Pre-collection failed, will collect during training")
+                                    print(f"     Pre-collection failed, will collect during training")
                         
                         # 继续训练，不退出
-                    # 🔥 DAgger-lite: Periodic on-policy collection (only in Phase 2+)
+                    #  DAgger-lite: Periodic on-policy collection (only in Phase 2+)
                     if (current_phase >= 2 and
                         global_step % args.onpolicy_collect_frequency == 0):
-                        print(f"\n🔄 [Step {global_step}] Starting on-policy data collection...")
+                        print(f"\n [Step {global_step}] Starting on-policy data collection...")
                         new_transitions = collect_onpolicy_transitions(
                             sess, QN_1, replay_buffer, G, edge_id_map, item_num,
                             args.onpolicy_collect_trajectories, args.onpolicy_max_steps,
@@ -2550,7 +2685,7 @@ if __name__ == '__main__':
                             user_embedding=user_embedding if args.use_user_embedding else None,
                             user_embeddings_dict=user_embeddings_dict if args.use_user_embedding else None
                         )
-                        print(f"  ✅ Collected {len(new_transitions)} transitions")
+                        print(f"   Collected {len(new_transitions)} transitions")
                         
                         # Add all transitions with labels (no hard filtering)
                         added_count = 0
@@ -2571,11 +2706,11 @@ if __name__ == '__main__':
                         
                         # Record collection batch for overlap calculation
                         onpolicy_buffer.record_collection_batch(new_transitions)
-                    # 🔥 Strict separation: SL must always use FULL expert data (unfiltered E-bucket)
+                    #  Strict separation: SL must always use FULL expert data (unfiltered E-bucket)
                     # Minimal change: regardless of Phase-2 fixed task, always sample globally for SL
                     expert_batch = replay_buffer.sample(n=args.batch_size).to_dict()
                     
-                    # 🔥 For RL training: Mix expert (E-bucket) + on-policy (O-bucket)
+                    #  For RL training: Mix expert (E-bucket) + on-policy (O-bucket)
                     # Determine mix ratio based on phase
                     if current_phase >= 2 and not onpolicy_buffer.is_empty():
                         # Calculate how many samples from each bucket
@@ -2591,7 +2726,7 @@ if __name__ == '__main__':
                         onpolicy_samples = onpolicy_buffer.sample(n=n_onpolicy)                    
                         # Combine for RL training
                         # Handle both dict and list formats for expert_rl_batch
-                        # 🔥 修复：新格式使用'taken_edge_id'，旧格式使用'action'
+                        #  修复：新格式使用'taken_edge_id'，旧格式使用'action'
                         action_key = 'taken_edge_id' if 'taken_edge_id' in expert_rl_batch else 'action'
                         
                         if isinstance(expert_rl_batch['state'], dict):
@@ -2609,7 +2744,7 @@ if __name__ == '__main__':
                             expert_len_next_states = expert_rl_batch['len_next_state']
                             expert_is_dones = expert_rl_batch.get('done', expert_rl_batch.get('is_done', [False] * len(expert_states)))
                         
-                        # 🔥 修复：处理新格式（taken_edge_id）和旧格式（action）
+                        #  修复：处理新格式（taken_edge_id）和旧格式（action）
                         onpolicy_actions = []
                         for t in onpolicy_samples:
                             if 'taken_edge_id' in t:
@@ -2636,32 +2771,32 @@ if __name__ == '__main__':
                     # For SL: use expert_batch (E-bucket only, ALWAYS unfiltered)
                     # For RL: use rl_batch (E-bucket + O-bucket mix)
                     
-                    # 🔥 根据训练阶段选择batch（仅用于RL训练计算，SL训练单独使用expert_batch）
+                    #  根据训练阶段选择batch（仅用于RL训练计算，SL训练单独使用expert_batch）
                     if current_phase >= 2:
                         # Phase-2+: batch用于RL训练（包含过滤后的E+O混合数据）
                         # 注意：SL训练在后续代码中单独使用expert_batch，不受此batch影响
                         batch = rl_batch
-                        # 🔥 检查RL batch是否为空（Phase-2固定任务模式可能没有expert数据）
+                        #  检查RL batch是否为空（Phase-2固定任务模式可能没有expert数据）
                         if len(batch['state']) == 0:
-                            print(f"⚠️  Empty RL batch at step {global_step}")
+                            print(f"  Empty RL batch at step {global_step}")
                             print(f"   Expert batch size: {len(expert_batch['state'])}")
                             print(f"   Onpolicy buffer size: {onpolicy_buffer.size()}")
                             print(f"   Current phase: {current_phase}")
                             print(f"   Skipping training, but incrementing global_step")
-                            # 🔥 即使batch为空，也要递增global_step，避免无限循环
+                            #  即使batch为空，也要递增global_step，避免无限循环
                             global_step += 1
                             continue
                     else:
                         # Phase-1: batch用于SL训练（全部都是expert数据，rl_batch = expert_batch）
                         batch = expert_batch
-                        # 🔥 检查SL batch是否为空
+                        #  检查SL batch是否为空
                         if len(batch['state']) == 0:
-                            print(f"⚠️  Empty SL batch at step {global_step}, skipping training, but incrementing global_step")
-                            # 🔥 即使batch为空，也要递增global_step，避免无限循环
+                            print(f"  Empty SL batch at step {global_step}, skipping training, but incrementing global_step")
+                            #  即使batch为空，也要递增global_step，避免无限循环
                             global_step += 1
                             continue
                     
-                    # 🔥 修复：处理batch数据格式，支持list、dict、pandas Series和numpy array
+                    #  修复：处理batch数据格式，支持list、dict、pandas Series和numpy array
                     def extract_batch_field(field_data):
                         """从batch中提取字段，支持list、dict、pandas Series和numpy array格式"""
                         if isinstance(field_data, list):
@@ -2681,7 +2816,7 @@ if __name__ == '__main__':
                             # 其他类型，尝试转换为list
                             return [field_data] if not isinstance(field_data, (list, tuple)) else list(field_data)
                     
-                    # 🔥 统一规范化函数：安全地将state转换为numpy数组，避免警告
+                    #  统一规范化函数：安全地将state转换为numpy数组，避免警告
                     def normalize_state_batch(state_list, state_size, feature_dim, name="state"):
                         """
                         规范化state批次数据，统一格式为numpy数组
@@ -2762,16 +2897,16 @@ if __name__ == '__main__':
                     len_state = extract_batch_field(batch['len_state'])
                     # 修复：replay_buffer 使用 'done' 而不是 'is_done'
                     is_done = extract_batch_field(batch.get('done', batch.get('is_done', [False] * len(state))))
-                    # 🔥 提取user_id用于数据标识
+                    #  提取user_id用于数据标识
                     user_ids = extract_batch_field(batch.get('user_id', [0] * len(state)))  # 默认user_id=0如果没有
                     
-                    # 🔥 统一规范化：使用统一的规范化函数，避免警告
+                    #  统一规范化：使用统一的规范化函数，避免警告
                     state = normalize_state_batch(state, state_size, feature_dim, name="state")
                     next_state = normalize_state_batch(next_state, state_size, feature_dim, name="next_state")
 
-                    # 🔥 新增：重建候选边特征用于候选边排序训练
+                    #  新增：重建候选边特征用于候选边排序训练
                     # 从batch数据中提取候选边信息和图上下文
-                    # 🔥 修复：使用args.max_candidates而不是mainQN.max_candidates（mainQN此时还未定义）
+                    #  修复：使用args.max_candidates而不是mainQN.max_candidates（mainQN此时还未定义）
                     max_candidates = args.max_candidates if hasattr(args, 'max_candidates') else 20
                     
                     graph_ids_batch = extract_batch_field(batch['graph_id'])  # 多图支持
@@ -2826,7 +2961,7 @@ if __name__ == '__main__':
                     cand_features_batch = np.array(cand_features_batch, dtype=np.float32)
                     cand_masks_batch = np.array(cand_masks_batch, dtype=np.float32)
                     
-                    # 🔥 如果启用了文本 embeddings，增强状态数据
+                    #  如果启用了文本 embeddings，增强状态数据
                     if args.use_text_embeddings and text_embedding_loader is not None:
                         state = enhance_states_with_text_embeddings(
                         state, G, edge_id_map,
@@ -2853,60 +2988,107 @@ if __name__ == '__main__':
                     target_QN = QN_2
                     if global_step % 100 == 0:
                         sess.run(soft_update_ops)
-                        # 🔥 Actor-Critic DDPG-style: Update Actor target with Polyak averaging
+                        #  Actor-Critic DDPG-style: Update Actor target with Polyak averaging
                         sess.run(actor_target_soft_update_ops)
 
                     current_phase, phase_name, rl_weight, current_lr = determine_training_phase(global_step, args, load_stage1_model)
                     
                     # 生成next state的action masks (for RL training)
                     next_action_masks = generate_action_mask_batch(next_state, G, edge_id_map, item_num)
-                    
-                    # 🔥 修复：计算target Q时不使用dropout（is_training=False）
+
+                    # 为target Q计算重建候选边特征（与邻居样本一致）
+                    next_cand_features_batch = []
+                    next_cand_masks_batch = []
+                    for b in range(len(next_state)):
+                        # 为next state生成候选边：使用有效的edge IDs作为候选边
+                        valid_edge_ids = np.where(next_action_masks[b] == 1)[0]
+                        if len(valid_edge_ids) > 0:
+                            # 限制候选边数量不超过max_candidates
+                            cand_edge_ids = valid_edge_ids[:mainQN.max_candidates].tolist()
+
+                            # 为next state生成候选边特征
+                            # 注意：next state没有明确的节点信息，使用简化特征
+                            cand_features = np.zeros((len(cand_edge_ids), mainQN.cand_feature_dim), dtype=np.float32)
+                            cand_mask = np.ones(len(cand_edge_ids), dtype=np.float32)
+                        else:
+                            # 如果没有有效动作，创建空候选边
+                            cand_edge_ids = []
+                            cand_features = np.zeros((mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
+                            cand_mask = np.zeros(mainQN.max_candidates, dtype=np.float32)
+
+                        # 填充到固定大小
+                        if len(cand_features) < mainQN.max_candidates:
+                            padding_size = mainQN.max_candidates - len(cand_features)
+                            padding_features = np.zeros((padding_size, mainQN.cand_feature_dim), dtype=np.float32)
+                            cand_features = np.concatenate([cand_features, padding_features], axis=0)
+                            cand_mask = np.concatenate([cand_mask, np.zeros(padding_size, dtype=np.float32)], axis=0)
+
+                        next_cand_features_batch.append(cand_features)
+                        next_cand_masks_batch.append(cand_mask)
+
+                    next_cand_features_batch = np.array(next_cand_features_batch)
+                    next_cand_masks_batch = np.array(next_cand_masks_batch)
+
+                    #  修复：计算target Q时不使用dropout（is_training=False）
                     # 避免bootstrap目标中引入噪声
                     next_state_feed_dict = {
                         target_QN.inputs: next_state,
-                        target_QN.len_state: len_next_state, 
+                        target_QN.len_state: len_next_state,
                         target_QN.action_mask: next_action_masks,
-                        target_QN.is_training: False,  # 🔥 修复：target不用dropout
+                        target_QN.cand_features: next_cand_features_batch,  # 真实的候选边特征
+                        target_QN.cand_mask: next_cand_masks_batch,       # 候选边mask
+                        target_QN.bc_action_idx: np.full(len(next_state), -1, dtype=np.int32),  # 默认值
+                        target_QN.is_training: False,  #  修复：target不用dropout
                         target_QN.training_phase: current_phase,
                         target_QN.rl_weight: rl_weight,
                         mainQN.inputs: next_state,
                         mainQN.len_state: len_next_state,
                         mainQN.action_mask: next_action_masks,
-                        mainQN.is_training: False,  # 🔥 修复：target不用dropout
+                        mainQN.cand_features: next_cand_features_batch,  # 真实的候选边特征
+                        mainQN.cand_mask: next_cand_masks_batch,       # 候选边mask
+                        mainQN.bc_action_idx: np.full(len(next_state), -1, dtype=np.int32),  # 默认值
+                        mainQN.is_training: False,  #  修复：target不用dropout
                         mainQN.training_phase: current_phase,
                         mainQN.rl_weight: rl_weight
                     }
-                    # 🔥 Actor-Critic DDPG-style: Get next_states_hidden and target Qs
-                    next_states_hidden, target_Qs, target_Qs_selector = sess.run(
-                        [mainQN.states_hidden, target_QN.output1_for_training, mainQN.output1_for_training],
+                    #  Actor-Critic DDPG-style: Get next_states_hidden and target Qs (candidate-based)
+                    next_states_hidden, target_Qs_candidates, target_Qs_selector_candidates = sess.run(
+                        [mainQN.states_hidden, target_QN.output1_candidates_for_training, mainQN.output1_candidates_for_training],
                         feed_dict=next_state_feed_dict
                     )
+
+                    # Use candidate Q values directly (they are already the right shape)
+                    target_Qs = target_Qs_candidates
+                    target_Qs_selector = target_Qs_selector_candidates
                     
-                    # 🔥 Actor-Critic DDPG-style: Compute Actor target probs π_tgt(a'|s')
+                    #  Actor-Critic DDPG-style: Compute Actor target probs π_tgt(a'|s')
                     # Only compute in Phase 2+ (RL training), use dummy values in Phase 1 (SL-only)
                     if current_phase >= 2:
+                        # Actor target使用与target Q相同的候选边特征
+                        # next_cand_features_batch 和 next_cand_masks_batch 已经在上面计算过了
+
                         actor_target_feed_dict = {
                             mainQN.next_states_hidden: next_states_hidden,
-                            mainQN.next_action_mask: next_action_masks,
+                            mainQN.next_cand_features: next_cand_features_batch,
+                            mainQN.next_cand_mask: next_cand_masks_batch,
                             mainQN.is_training: False,  # Actor target doesn't use dropout
                             mainQN.training_phase: current_phase,
                             mainQN.rl_weight: rl_weight
                         }
                         actor_target_probs = sess.run(mainQN.actor_target_output, feed_dict=actor_target_feed_dict)
                     else:
-                        # Phase 1 (SL-only): Use dummy uniform distribution
+                        # Phase 1 (SL-only): Use dummy uniform distribution over candidates
                         batch_size = target_Qs.shape[0]
-                        actor_target_probs = np.ones((batch_size, item_num), dtype=np.float32) / item_num
+                        actor_target_probs = np.ones((batch_size, mainQN.max_candidates), dtype=np.float32) / mainQN.max_candidates
 
-                    # 🔥 修复：终止状态已经通过discount=0处理，不需要再清零target_Qs
+                    #  修复：终止状态已经通过discount=0处理，不需要再清零target_Qs
                     # 删除冗余的target_Qs[terminal_mask]=0
 
                     # 生成current state的action masks
                     current_action_masks = generate_action_mask_batch(state, G, edge_id_map, item_num, debug_output=True)
                     
                     # 提取动作信息
-                    # 🔥 修复：新格式使用'taken_edge_id'，旧格式使用'action'
+                    #  修复：新格式使用'taken_edge_id'，旧格式使用'action'
                     if 'taken_edge_id' in batch:
                         # 新格式：直接使用taken_edge_id（已经是edge ID）
                         if isinstance(batch['taken_edge_id'], list):
@@ -2922,12 +3104,24 @@ if __name__ == '__main__':
                         action_ids = extract_action_ids(action, edge_id_map)
                     else:
                         raise KeyError("Batch must contain either 'taken_edge_id' (new format) or 'action' (old format)")
+
+                    #  新增：提取bc_action_idx（候选边动作索引）
+                    bc_action_idx_batch = None
+                    if 'bc_action_idx' in batch:
+                        # 新格式：有bc_action_idx，直接使用
+                        if isinstance(batch['bc_action_idx'], list):
+                            bc_action_idx_batch = batch['bc_action_idx']
+                        else:
+                            bc_action_idx_batch = list(batch['bc_action_idx'].values())
+                        bc_action_idx_batch = np.array(bc_action_idx_batch, dtype=np.int32)
+                    else:
+                        raise ValueError("bc_action_idx not found in batch")
                     
 
                     batch_size = len(state)
                     
-                    # 🔥 路线A：邻居覆盖TD（替代原有的随机负样本）
-                    # 🔥 修复：固定邻居列数 = args.neg，保持和TRFL循环一致
+                    #  路线A：邻居覆盖TD（替代原有的随机负样本）
+                    #  修复：固定邻居列数 = args.neg，保持和TRFL循环一致
                     max_neighbors_per_sample = args.neg  # 固定列数，避免维度不匹配
                     neighbor_samples = []
                     neighbor_counts = []  # 记录每个样本的实际邻居数
@@ -2940,7 +3134,7 @@ if __name__ == '__main__':
                         # 使用邻居覆盖策略（包含专家动作）
                         neighbor_ids = generate_neighbor_actions(action_id, valid_edge_ids, max_neighbors_per_sample)
                         
-                        # 🔥 修复：始终填充/截断到固定长度 args.neg
+                        #  修复：始终填充/截断到固定长度 args.neg
                         if len(neighbor_ids) < args.neg:
                             # 使用item_num作为越界ID（而不是0，避免与真实动作混淆）
                             padded_neighbors = neighbor_ids + [item_num] * (args.neg - len(neighbor_ids))
@@ -2951,7 +3145,7 @@ if __name__ == '__main__':
                         neighbor_samples.append(padded_neighbors)
                         neighbor_counts.append(len(neighbor_ids))
                     
-                    # 🔥 修复：max_neighbors_in_batch 现在是固定的 args.neg
+                    #  修复：max_neighbors_in_batch 现在是固定的 args.neg
                     max_neighbors_in_batch = args.neg
                     padded_neighbor_samples = neighbor_samples
                     
@@ -2985,48 +3179,71 @@ if __name__ == '__main__':
                     
                     combined_neighbor_masks = generate_action_mask_batch(combined_neighbor_states, G, edge_id_map, item_num, debug_output=False)
                     
-                    # 🔥 修复：Double Q - selector用main Q，价值用target Q
+                    #  修复：Double Q - selector用main Q，价值用target Q
+                    # 为邻居状态创建虚拟候选边特征
+                    neighbor_batch_size = len(combined_neighbor_states)
+                    neighbor_dummy_cand_features = np.zeros((neighbor_batch_size, mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
+                    neighbor_dummy_cand_masks = np.ones((neighbor_batch_size, mainQN.max_candidates), dtype=np.float32)
+
                     # Selector Q: 用main Q选择最优动作
                     combined_neighbor_selector_Q = sess.run(mainQN.output1_for_training,
                                                 feed_dict={
                                                     mainQN.inputs: combined_neighbor_states,
                                                     mainQN.len_state: combined_neighbor_len_states,
                                                     mainQN.action_mask: combined_neighbor_masks,
+                                                    mainQN.cand_features: neighbor_dummy_cand_features,
+                                                    mainQN.cand_mask: neighbor_dummy_cand_masks,
+                                                    mainQN.bc_action_idx: np.full(len(combined_neighbor_states), -1, dtype=np.int32),
                                                     mainQN.is_training: False,
                                                     mainQN.training_phase: current_phase,
                                                     mainQN.rl_weight: rl_weight
                                                 })
-                    
+
                     # Target Q: 用target Q估值
-                    combined_neighbor_target_Q = sess.run(target_QN.output1_for_training,
+                    combined_neighbor_target_Q = sess.run(target_QN.output1_candidates_for_training,
                                                 feed_dict={
                                                     target_QN.inputs: combined_neighbor_states,
                                                     target_QN.len_state: combined_neighbor_len_states,
                                                     target_QN.action_mask: combined_neighbor_masks,
+                                                    target_QN.cand_features: neighbor_dummy_cand_features,
+                                                    target_QN.cand_mask: neighbor_dummy_cand_masks,
+                                                    target_QN.bc_action_idx: np.full(len(combined_neighbor_states), -1, dtype=np.int32),
                                                     target_QN.is_training: False,
                                                     target_QN.training_phase: current_phase,
                                                     target_QN.rl_weight: rl_weight
                                                 })
                     
-                    # 🔥 Actor-Critic DDPG-style: Compute Actor target probs for neighbors
+                    #  Actor-Critic DDPG-style: Compute Actor target probs for neighbors
                     # Only compute in Phase 2+ (RL training)
                     if current_phase >= 2:
-                        # 🔥 Actor-Critic DDPG-style: Get hidden features for Actor target (neighbors)
+                        #  Actor-Critic DDPG-style: Get hidden features for Actor target (neighbors)
+                        # 为邻居状态创建虚拟候选边特征（用于获取hidden states）
+                        neighbor_hidden_dummy_cand_features = np.zeros((len(combined_neighbor_states), mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
+                        neighbor_hidden_dummy_cand_masks = np.ones((len(combined_neighbor_states), mainQN.max_candidates), dtype=np.float32)
+
                         combined_neighbor_hidden = sess.run(mainQN.states_hidden,
                                                     feed_dict={
                                                         mainQN.inputs: combined_neighbor_states,
                                                         mainQN.len_state: combined_neighbor_len_states,
                                                         mainQN.action_mask: combined_neighbor_masks,
+                                                        mainQN.cand_features: neighbor_hidden_dummy_cand_features,
+                                                        mainQN.cand_mask: neighbor_hidden_dummy_cand_masks,
+                                                        mainQN.bc_action_idx: np.full(len(combined_neighbor_states), -1, dtype=np.int32),
                                                         mainQN.is_training: False,
                                                         mainQN.training_phase: current_phase,
                                                         mainQN.rl_weight: rl_weight
                                                     })
                         
-                        # 🔥 Actor-Critic DDPG-style: Compute Actor target probs for neighbors
+                        #  Actor-Critic DDPG-style: Compute Actor target probs for neighbors
+                        # Create dummy candidate features for neighbors (simplified)
+                        combined_neighbor_cand_features = np.zeros((len(combined_neighbor_hidden), mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
+                        combined_neighbor_cand_masks = np.ones((len(combined_neighbor_hidden), mainQN.max_candidates), dtype=np.float32)
+
                         combined_neighbor_actor_target_probs = sess.run(mainQN.actor_target_output,
                                                                     feed_dict={
                                                                         mainQN.next_states_hidden: combined_neighbor_hidden,
-                                                                        mainQN.next_action_mask: combined_neighbor_masks,
+                                                                        mainQN.next_cand_features: combined_neighbor_cand_features,
+                                                                        mainQN.next_cand_mask: combined_neighbor_cand_masks,
                                                                         mainQN.is_training: False,
                                                                         mainQN.training_phase: current_phase,
                                                                         mainQN.rl_weight: rl_weight
@@ -3054,17 +3271,17 @@ if __name__ == '__main__':
                             end_idx = (neighbor_idx + 1) * batch_size
                             neighbor_target_Q = combined_neighbor_target_Q[start_idx:end_idx]
                             neighbor_selector_Q = combined_neighbor_selector_Q[start_idx:end_idx]
-                            # Dummy uniform distribution for Phase 1
-                            dummy_actor_probs = np.ones((batch_size, item_num), dtype=np.float32) / item_num
+                            # Dummy uniform distribution for Phase 1 (candidate space)
+                            dummy_actor_probs = np.ones((batch_size, mainQN.max_candidates), dtype=np.float32) / mainQN.max_candidates
                             neighbor_target_Qs.append(neighbor_target_Q)
                             neighbor_selector_Qs.append(neighbor_selector_Q)
                             neighbor_actor_target_probs_list.append(dummy_actor_probs)
                     
-                    # 🔥 处理无效邻居（填充的越界ID）和邻居终止状态
+                    #  处理无效邻居（填充的越界ID）和邻居终止状态
                     padded_neighbor_array = np.array(padded_neighbor_samples)
                     neighbor_is_done_list = []
                     
-                    # 🔥 预先计算path_infos，用于邻居终止状态检测
+                    #  预先计算path_infos，用于邻居终止状态检测
                     path_infos = []
                     for k in range(len(is_done)):
                         path_info = {}
@@ -3077,7 +3294,7 @@ if __name__ == '__main__':
                                     break
                             
                             if initial_state is not None and len(initial_state) >= 15:
-                                # 🔥 修复：使用固定索引，而不是负索引
+                                #  修复：使用固定索引，而不是负索引
                                 # origin_x, origin_y 在索引 9, 10
                                 # dest_x, dest_y 在索引 11, 12
                                 start_x, start_y = initial_state[9], initial_state[10]
@@ -3100,7 +3317,7 @@ if __name__ == '__main__':
                         path_infos.append(path_info)
                     
                     for neighbor_idx in range(max_neighbors_in_batch):
-                        # 🔥 计算邻居的终止状态（基于邻居的next_state）
+                        #  计算邻居的终止状态（基于邻居的next_state）
                         neighbor_is_done = np.zeros(batch_size, dtype=bool)
                         for k in range(batch_size):
                             neighbor_action_id = padded_neighbor_array[k, neighbor_idx]
@@ -3117,10 +3334,14 @@ if __name__ == '__main__':
                         
                         neighbor_is_done_list.append(neighbor_is_done)
                         
-                        # 🔥 越界ID（填充）或邻居终止状态的Q值设为0
+                        #  越界ID（填充）或邻居终止状态的Q值设为0
                         invalid_mask = (padded_neighbor_array[:, neighbor_idx] >= item_num) | neighbor_is_done
                         neighbor_target_Qs[neighbor_idx][invalid_mask] = 0.0
                         neighbor_selector_Qs[neighbor_idx][invalid_mask] = 0.0
+
+                    # 为当前状态创建虚拟候选边特征
+                    current_dummy_cand_features = np.zeros((len(state), mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
+                    current_dummy_cand_masks = np.ones((len(state), mainQN.max_candidates), dtype=np.float32)
 
                     predictions = sess.run(
                         mainQN.probs,
@@ -3128,6 +3349,9 @@ if __name__ == '__main__':
                             mainQN.inputs: state,
                             mainQN.len_state: len_state,
                             mainQN.action_mask: current_action_masks,
+                            mainQN.cand_features: current_dummy_cand_features,
+                            mainQN.cand_mask: current_dummy_cand_masks,
+                            mainQN.bc_action_idx: np.full(len(state), -1, dtype=np.int32),
                             mainQN.is_training: False,
                             mainQN.training_phase: current_phase,
                             mainQN.rl_weight: rl_weight,
@@ -3156,19 +3380,19 @@ if __name__ == '__main__':
                         reward_value, reward_comps = calculate_improved_reward(
                             action_ids[k], is_done[k],
                             reward_goal,
-                            current_step_idx, next_state[k], current_path_info,  # 🔥 修复：使用next_state而不是state
+                            current_step_idx, next_state[k], current_path_info,  #  修复：使用next_state而不是state
                             prev_action=prev_action_k, edge_id_map=edge_id_map,
                             step_penalty=args.r_step,
                             backtrack_penalty=args.r_backtrack
                         )
                         reward.append(reward_value)
                     
-                    # 🔥 步骤2&3：检测坏动作并应用终止强负
+                    #  步骤2&3：检测坏动作并应用终止强负
                     # 参数设置
                     K_RECENT = 10  # 最近K步回环检测窗口
                     C_LOOP = 0.5  # 终止强负幅度
                     
-                    # 🔥 提取最近K步的edge_id列表（用于回环检测）
+                    #  提取最近K步的edge_id列表（用于回环检测）
                     # 由于是无向图，直接记录最近K步走过的edge_id
                     recent_edge_ids_batch = []
                     for k in range(batch_size):
@@ -3193,7 +3417,7 @@ if __name__ == '__main__':
                             if neighbor_action_id >= item_num:
                                 neighbor_rewards_for_this_idx.append(0.0)
                             else:
-                                # 🔥 检测是否为坏动作（回环）
+                                #  检测是否为坏动作（回环）
                                 # 策略：检查当前edge_id是否在最近K步中已经走过
                                 # 由于是无向图，重复走同一条边就是回环
                                 is_bad_action = False
@@ -3204,12 +3428,12 @@ if __name__ == '__main__':
                                         bad_action_counts['revisit'] += 1
                                         bad_action_counts['total'] += 1
                                 
-                                # 🔥 根据是否为坏动作设置奖励
+                                #  根据是否为坏动作设置奖励
                                 if is_bad_action:
                                     # 坏动作：终止强负（reward=-C_LOOP）
                                     neighbor_reward_value = -C_LOOP
                                 else:
-                                    # 🔥 正常动作：使用邻居自己的next_state计算奖励
+                                    #  正常动作：使用邻居自己的next_state计算奖励
                                     neighbor_next_state = neighbor_next_states[k, neighbor_idx]
                                     neighbor_next_pos = extract_position_from_state_for_shaping(neighbor_next_state)
                                     
@@ -3237,9 +3461,9 @@ if __name__ == '__main__':
                                         is_done=False,  # 邻居动作不会导致终止
                                         reward_goal=reward_goal,
                                         step_idx=current_step_idx,
-                                        state_history=neighbor_next_state,  # 🔥 修复：使用邻居的下一状态
+                                        state_history=neighbor_next_state,  #  修复：使用邻居的下一状态
                                         path_info=neighbor_path_info,
-                                        prev_action=prev_action_k,  # 🔥 修复：使用相同的前一个动作
+                                        prev_action=prev_action_k,  #  修复：使用相同的前一个动作
                                         edge_id_map=edge_id_map,
                                         step_penalty=args.r_step,
                                         backtrack_penalty=args.r_backtrack
@@ -3250,7 +3474,7 @@ if __name__ == '__main__':
                     
                     # 坏动作统计（只在log_frequency时打印）
                     if global_step % args.log_frequency == 0 and bad_action_counts['total'] > 0:
-                        print(f"  ⚠️  Bad Actions: {bad_action_counts['total']} (revisit={bad_action_counts['revisit']})")
+                        print(f"    Bad Actions: {bad_action_counts['total']} (revisit={bad_action_counts['revisit']})")
                     
                     # 计算discount
                     discount = []
@@ -3261,18 +3485,18 @@ if __name__ == '__main__':
                     # 准备邻居数据（替代原有的负样本）
                     neighbor_actions_array = padded_neighbor_array  # [batch_size, max_neighbors]
                     neighbor_rewards_array = np.array(neighbor_rewards_list).T  # [batch_size, max_neighbors]
-                    neighbor_target_Qs_array = np.array(neighbor_target_Qs).transpose(1, 0, 2)  # [batch_size, max_neighbors, item_num]
-                    # 🔥 Actor-Critic DDPG: Actor target probs for neighbors
-                    neighbor_actor_target_probs_array = np.array(neighbor_actor_target_probs_list).transpose(1, 0, 2)  # [batch_size, max_neighbors, item_num]
+                    neighbor_target_Qs_array = np.array(neighbor_target_Qs).transpose(1, 0, 2)  # [batch_size, max_neighbors, max_candidates]
+                    #  Actor-Critic DDPG: Actor target probs for neighbors
+                    neighbor_actor_target_probs_array = np.array(neighbor_actor_target_probs_list).transpose(1, 0, 2)  # [batch_size, max_neighbors, max_candidates]
                     
-                    # 🔥 GPT建议: 负样本终止处理 - 回环样本设为终止状态，无bootstrap
+                    #  GPT建议: 负样本终止处理 - 回环样本设为终止状态，无bootstrap
                     # 对识别为回环的邻居样本：
                     # 1. discount = 0.0 (终止)
                     # 2. target_Q = 0.0, selector_Q = 0.0 (无bootstrap)
                     # 3. loss_mask = 1.0 (参与训练，非padding)
                     neighbor_discounts = np.full((batch_size, max_neighbors_in_batch), args.discount, dtype=np.float32)
                     
-                    # 🔥 性能优化：复用已计算的action masks（在第5893行已经计算过）
+                    #  性能优化：复用已计算的action masks（在第5893行已经计算过）
                     # 避免重复计算，直接从current_action_masks提取valid edge IDs
                     batch_action_masks_cache = {}
                     for k in range(batch_size):
@@ -3288,7 +3512,7 @@ if __name__ == '__main__':
                                 if len(recent_edge_ids_batch[k]) > 0:
                                     # 如果当前edge_id在最近K步中出现过 → 回环 → 设为终止状态
                                     if neighbor_action_id in recent_edge_ids_batch[k]:
-                                        # 🔥 死胡同豁免：检查是否只有这一条合法边（使用预计算的mask）
+                                        #  死胡同豁免：检查是否只有这一条合法边（使用预计算的mask）
                                         valid_edge_ids_at_k = batch_action_masks_cache.get(k, np.array([]))
                                         # 如果只有1条合法边且就是这条"回头边"，则豁免
                                         if len(valid_edge_ids_at_k) == 1 and valid_edge_ids_at_k[0] == neighbor_action_id:
@@ -3305,7 +3529,7 @@ if __name__ == '__main__':
                     neighbor_loss_weight = 0.5 if current_phase >= 2 else 0.0
                     
                     # 构造feed_dict（使用邻居数据）
-                    # 🔥 构造损失掩码：填充位置零损失
+                    #  构造损失掩码：填充位置零损失
                     negative_loss_mask_array = np.zeros((batch_size, max_neighbors_in_batch), dtype=np.float32)
                     for k in range(batch_size):
                         for neighbor_idx in range(max_neighbors_in_batch):
@@ -3313,7 +3537,7 @@ if __name__ == '__main__':
                             if neighbor_action_id < item_num:  # 非填充ID
                                 negative_loss_mask_array[k, neighbor_idx] = 1.0
                     
-                    # 🔥 新增：为负样本重建候选边特征用于训练
+                    #  新增：为负样本重建候选边特征用于训练
                     # 使用之前已经提取的候选边信息（在8408-8411行提取）
                     # 注意：这里重用已经提取的变量，而不是重新提取
                     batch_cand_features = []
@@ -3353,26 +3577,42 @@ if __name__ == '__main__':
                     batch_cand_features = np.array(batch_cand_features)  # [batch_size, max_candidates, feature_dim]
                     batch_cand_masks = np.array(batch_cand_masks)      # [batch_size, max_candidates]
 
+                    #  计算RL训练的候选边动作索引：将全局edge_id转换为候选边索引
+                    rl_action_cand_idx_batch = []
+                    for b in range(batch_size):
+                        action_edge_id = action_ids[b]
+                        cand_edge_ids = cand_edge_ids_batch[b]
+                        # 找到动作edge_id在候选边列表中的索引
+                        if action_edge_id in cand_edge_ids:
+                            cand_idx = cand_edge_ids.index(action_edge_id)
+                        else:
+                            # 如果不在候选边中（理论上不应该发生），使用第一个候选边
+                            cand_idx = 0
+                        rl_action_cand_idx_batch.append(cand_idx)
+                    rl_action_cand_idx_batch = np.array(rl_action_cand_idx_batch, dtype=np.int32)
+
                     feed_dict = build_feed_dict(mainQN, state, len_state, target_Qs, reward,
                                             discount, action_ids, target_Qs_selector, current_action_masks,
                                             current_phase, rl_weight,
-                                            actor_target_probs=actor_target_probs,  # 🔥 Actor-Critic DDPG
+                                            actor_target_probs=actor_target_probs,  #  Actor-Critic DDPG
                                             negative_actions=neighbor_actions_array,
                                             negative_rewards=neighbor_rewards_array,
                                             negative_target_Qs=neighbor_target_Qs_array,
-                                            negative_actor_target_probs=neighbor_actor_target_probs_array,  # 🔥 Actor-Critic DDPG
+                                            negative_actor_target_probs=neighbor_actor_target_probs_array,  #  Actor-Critic DDPG
                                             negative_loss_weight=neighbor_loss_weight,
-                                            negative_loss_mask=negative_loss_mask_array,  # 🔥 传递损失掩码
-                                            actor_rl_weight=args.actor_rl_weight,  # 🔥 Actor RL辅损权重 λ_RL
-                                            cand_features=cand_features_batch,  # 🔥 新增：重建的候选边特征
-                                            cand_mask=cand_masks_batch,         # 🔥 新增：候选边mask
+                                            negative_loss_mask=negative_loss_mask_array,  #  传递损失掩码
+                                            actor_rl_weight=args.actor_rl_weight,  #  Actor RL辅损权重 λ_RL
+                                            cand_features=cand_features_batch,  #  新增：重建的候选边特征
+                                            cand_mask=cand_masks_batch,         #  新增：候选边mask
+                                            bc_action_idx=bc_action_idx_batch,  #  新增：候选边动作索引
+                                            rl_action_cand_idx=rl_action_cand_idx_batch,  #  新增：RL候选边动作索引
                                             is_training=True)
                 
                 
-                    # 🔥 Execute training steps with strict SL/RL separation
+                    #  Execute training steps with strict SL/RL separation
                     loss_components = sess.run(mainQN.loss_components, feed_dict=feed_dict)
                     
-                    # 🔥 Separate training for SL and RL heads
+                    #  Separate training for SL and RL heads
                     if current_phase == 1:
                         # Phase 1: SL-only training on expert data
                         sess.run(mainQN.train_phase1, feed_dict=feed_dict)
@@ -3380,9 +3620,9 @@ if __name__ == '__main__':
                     elif current_phase >= 2:
                         # Phase 2+: Separate training with different data for different heads
                         
-                        # 🔥 Step 1: Train SL head + shared encoder on expert data
+                        #  Step 1: Train SL head + shared encoder on expert data
                         # Extract expert data for SL training
-                        # 🔥 修复：新格式使用'taken_edge_id'，旧格式使用'action'
+                        #  修复：新格式使用'taken_edge_id'，旧格式使用'action'
                         action_key = 'taken_edge_id' if 'taken_edge_id' in expert_batch else 'action'
                         
                         if isinstance(expert_batch['state'], dict):
@@ -3396,11 +3636,11 @@ if __name__ == '__main__':
                             expert_len_state = expert_batch['len_state']
                             expert_user_ids = expert_batch.get('user_id', [0] * len(expert_state))
                         
-                        # 🔥 确保expert_state是numpy数组
+                        #  确保expert_state是numpy数组
                         if isinstance(expert_state, list):
                             expert_state = np.array(expert_state)
                         
-                        # 🔥 如果启用了文本 embeddings，增强专家状态数据
+                        #  如果启用了文本 embeddings，增强专家状态数据
                         if args.use_text_embeddings and text_embedding_loader is not None:
                             expert_state = enhance_states_with_text_embeddings(
                                 expert_state, G, edge_id_map,
@@ -3421,26 +3661,107 @@ if __name__ == '__main__':
                         
                         expert_action_masks = generate_action_mask_batch(expert_state, G, edge_id_map, item_num)
                         expert_action_ids = extract_action_ids(expert_action, edge_id_map)
+
+                        #  新增：提取bc_action_idx（用于候选边SL训练）
+                        if 'bc_action_idx' in expert_batch:
+                            if isinstance(expert_batch['bc_action_idx'], dict):
+                                expert_bc_action_idx = list(expert_batch['bc_action_idx'].values())
+                            else:
+                                expert_bc_action_idx = expert_batch['bc_action_idx']
+                            expert_bc_action_idx = np.array(expert_bc_action_idx, dtype=np.int32)
+                        else:
+                            # 如果没有bc_action_idx，使用-1表示无效（会自动选择全局SL损失）
+                            raise ValueError("bc_action_idx not found in expert_batch")
                         
+                        # 为expert数据重建候选边特征
+                        expert_cand_features = []
+                        expert_cand_masks = []
+
+                        for b in range(len(expert_state)):
+                            cand_edge_ids = []  # 需要从expert数据中提取候选边
+                            if 'cand_edge_ids' in expert_batch:
+                                if isinstance(expert_batch['cand_edge_ids'], dict):
+                                    cand_edge_ids = list(expert_batch['cand_edge_ids'].values())[b]
+                                else:
+                                    cand_edge_ids = expert_batch['cand_edge_ids'][b] if b < len(expert_batch['cand_edge_ids']) else []
+
+                            if cand_edge_ids:
+                                # 重建候选边特征
+                                cur_node_id = None
+                                goal_node_id = None
+                                d_start = 100.0
+                                prev_node_id = None
+                                recent_visited = []
+
+                                if 'cur_node_id' in expert_batch:
+                                    if isinstance(expert_batch['cur_node_id'], dict):
+                                        cur_node_id = list(expert_batch['cur_node_id'].values())[b]
+                                    else:
+                                        cur_node_id = expert_batch['cur_node_id'][b] if b < len(expert_batch['cur_node_id']) else None
+
+                                if 'goal_node_id' in expert_batch:
+                                    if isinstance(expert_batch['goal_node_id'], dict):
+                                        goal_node_id = list(expert_batch['goal_node_id'].values())[b]
+                                    else:
+                                        goal_node_id = expert_batch['goal_node_id'][b] if b < len(expert_batch['goal_node_id']) else None
+
+                                if cur_node_id is not None and goal_node_id is not None and feature_builder is not None:
+                                    # 重建真实的候选边特征（必须成功，不能使用默认值）
+                                    cand_features = feature_builder.build_candidate_features(
+                                        cand_edge_ids=cand_edge_ids,
+                                        cur_node_id=cur_node_id,
+                                        goal_node_id=goal_node_id,
+                                        d_start=d_start,
+                                        prev_node_id=prev_node_id,
+                                        recent_visited_nodes=recent_visited
+                                    )
+                                    # 检查是否有nan值
+                                    if np.any(np.isnan(cand_features)):
+                                        raise ValueError(f"Candidate features contain NaN values for batch {b}")
+                                else:
+                                    # 如果没有节点信息，必须报错，不能使用默认特征
+                                    raise ValueError(f"Missing required data for candidate feature reconstruction in batch {b}: cur_node_id={cur_node_id}, goal_node_id={goal_node_id}, feature_builder={feature_builder is not None}")
+
+                                cand_mask = np.ones(len(cand_edge_ids), dtype=np.float32)
+                            else:
+                                cand_features = np.zeros((mainQN.max_candidates, 12), dtype=np.float32)
+                                cand_mask = np.zeros(mainQN.max_candidates, dtype=np.float32)
+
+                            # 填充到固定大小
+                            if len(cand_features) < mainQN.max_candidates:
+                                padding_size = mainQN.max_candidates - len(cand_features)
+                                padding_features = np.zeros((padding_size, 12), dtype=np.float32)
+                                cand_features = np.concatenate([cand_features, padding_features], axis=0)
+                                cand_mask = np.concatenate([cand_mask, np.zeros(padding_size, dtype=np.float32)], axis=0)
+
+                            expert_cand_features.append(cand_features)
+                            expert_cand_masks.append(cand_mask)
+
+                        expert_cand_features = np.array(expert_cand_features)
+                        expert_cand_masks = np.array(expert_cand_masks)
+
                         expert_feed_dict = {
                             mainQN.inputs: expert_state,
                             mainQN.len_state: expert_len_state,
                             mainQN.action_mask: expert_action_masks,
+                            mainQN.cand_features: expert_cand_features,  # 新增：候选边特征
+                            mainQN.cand_mask: expert_cand_masks,        # 新增：候选边mask
                             mainQN.actions: expert_action_ids,
+                            mainQN.bc_action_idx: expert_bc_action_idx,  #  新增：候选边动作索引
                             mainQN.is_training: True,
                             mainQN.training_phase: current_phase,
                             mainQN.rl_weight: rl_weight,
-                            mainQN.actor_rl_weight: args.actor_rl_weight,  # 🔥 Actor RL辅损权重 λ_RL
+                            mainQN.actor_rl_weight: args.actor_rl_weight,  #  Actor RL辅损权重 λ_RL
                             # Dummy values for RL-related placeholders (not used in SL training)
-                            mainQN.targetQs_: np.zeros((len(expert_state), item_num), dtype=np.float32),
+                            mainQN.targetQs_: np.zeros((len(expert_state), mainQN.max_candidates), dtype=np.float32),
                             mainQN.reward: np.zeros(len(expert_state), dtype=np.float32),
                             mainQN.discount: np.zeros(len(expert_state), dtype=np.float32),
-                            mainQN.targetQs_selector: np.zeros((len(expert_state), item_num), dtype=np.float32),
-                            mainQN.actor_target_probs: np.zeros((len(expert_state), item_num), dtype=np.float32),  # 🔥 Actor-Critic
+                            mainQN.targetQs_selector: np.zeros((len(expert_state), mainQN.max_candidates), dtype=np.float32),
+                            mainQN.actor_target_probs: np.zeros((len(expert_state), mainQN.max_candidates), dtype=np.float32),  #  Actor-Critic
                             mainQN.negative_actions: np.zeros((len(expert_state), 0), dtype=np.int32),
                             mainQN.negative_rewards: np.zeros((len(expert_state), 0), dtype=np.float32),
-                            mainQN.negative_target_Qs: np.zeros((len(expert_state), 0, item_num), dtype=np.float32),
-                            mainQN.negative_actor_target_probs: np.zeros((len(expert_state), 0, item_num), dtype=np.float32),  # 🔥 Actor-Critic
+                            mainQN.negative_target_Qs: np.zeros((len(expert_state), 0, mainQN.max_candidates), dtype=np.float32),
+                            mainQN.negative_actor_target_probs: np.zeros((len(expert_state), 0, mainQN.max_candidates), dtype=np.float32),  #  Actor-Critic
                             mainQN.negative_loss_mask: np.zeros((len(expert_state), 0), dtype=np.float32),
                             mainQN.negative_loss_weight: 0.0
                         }
@@ -3448,12 +3769,12 @@ if __name__ == '__main__':
                         # Train SL head on expert data
                         sess.run(mainQN.sl_head_optimizer, feed_dict=expert_feed_dict)
                         
-                        # 🔥 Step 2: Train RL head on mixed data
+                        #  Step 2: Train RL head on mixed data
                         # Use the previously computed feed_dict which contains mixed RL batch
                         sess.run(mainQN.q_head_optimizer, feed_dict=feed_dict)
                         
-                        # 🔥 Step 3: Update shared encoder (RL去耦版本)
-                        # 🔥 RL去耦：由于Q head使用了stop_gradient，RL梯度已经被阻断
+                        #  Step 3: Update shared encoder (RL去耦版本)
+                        #  RL去耦：由于Q head使用了stop_gradient，RL梯度已经被阻断
                         # 共享编码器只会被SL梯度更新，因此始终使用expert数据即可
                         # 不再需要复杂的冻结和梯度合成逻辑
                         sess.run(mainQN.shared_encoder_optimizer, feed_dict=expert_feed_dict)
@@ -3482,9 +3803,9 @@ if __name__ == '__main__':
 
                     total_loss = tensor_to_scalar(loss_components['total_loss'])
                     
-                    # 🔥 详细统计信息：只在log_frequency时打印
+                    #  详细统计信息：只在log_frequency时打印
                     if global_step % args.log_frequency == 0:
-                        # 🔥 Log on-policy buffer statistics
+                        #  Log on-policy buffer statistics
                         onpolicy_size = onpolicy_buffer.size()
                         onpolicy_ratio_actual = 0.0
                         if current_phase >= 2 and onpolicy_size > 0:
@@ -3493,7 +3814,7 @@ if __name__ == '__main__':
                         
                         # 在线策略缓冲区统计（只在log_frequency时打印）
                         if current_phase >= 2:
-                            print(f"  📊 O-bucket: {onpolicy_size}/{args.onpolicy_buffer_size} "
+                            print(f"   O-bucket: {onpolicy_size}/{args.onpolicy_buffer_size} "
                                 f"(mix={onpolicy_ratio_actual:.2f}, {int(args.batch_size * args.onpolicy_mix_ratio)}/{args.batch_size} samples)")
                         
                         # 提取Q值统计信息
@@ -3593,14 +3914,14 @@ if __name__ == '__main__':
                             
                             
                             if instability_detected:
-                                print(f"  ⚠️  RL Instability Detected:")
+                                print(f"    RL Instability Detected:")
                                 for warning in instability_warnings:
                                     print(f"      - {warning}")
                         
                         # 计算correct_predictions和total_samples用于logger
                         if current_phase >= 2:
                             # Phase-2: SL准确率只计算expert部分
-                            # 🔥 修复：基于expert数据单独计算predictions，而不是从混合batch中切片
+                            #  修复：基于expert数据单独计算predictions，而不是从混合batch中切片
                             # 因为混合batch中expert数据的位置不确定，且expert_state已经在训练时处理好了
                             if 'expert_state' in locals() and expert_state is not None and len(expert_state) > 0 and 'expert_action_ids' in locals():
                                 # expert_state已经在训练时处理好了（包括文本embeddings增强），直接使用
@@ -3611,6 +3932,11 @@ if __name__ == '__main__':
                                     # 如果expert_action_masks不可用，重新计算
                                     expert_action_masks_for_acc = generate_action_mask_batch(expert_state, G, edge_id_map, item_num)
                                 
+                                # 为expert数据创建虚拟候选边特征（用于评估）
+                                expert_batch_size = len(expert_state)
+                                expert_dummy_cand_features = np.zeros((expert_batch_size, mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
+                                expert_dummy_cand_masks = np.ones((expert_batch_size, mainQN.max_candidates), dtype=np.float32)
+
                                 # 计算expert数据的predictions
                                 expert_predictions = sess.run(
                                     mainQN.probs,
@@ -3618,25 +3944,52 @@ if __name__ == '__main__':
                                         mainQN.inputs: expert_state,
                                         mainQN.len_state: expert_len_state if 'expert_len_state' in locals() else [1] * len(expert_state),
                                         mainQN.action_mask: expert_action_masks_for_acc,
+                                        mainQN.cand_features: expert_dummy_cand_features,
+                                        mainQN.cand_mask: expert_dummy_cand_masks,
+                                        mainQN.bc_action_idx: np.full(len(expert_state), -1, dtype=np.int32),
                                         mainQN.is_training: False,
                                         mainQN.training_phase: current_phase,
                                         mainQN.rl_weight: rl_weight,
                                     }
                                 )
                                 expert_top1_preds = np.argmax(expert_predictions, axis=1)
-                                correct_predictions = np.sum(expert_top1_preds == expert_action_ids)
+                                # 对于新架构，使用BC索引作为ground truth
+                                if 'expert_bc_action_idx' in locals() and expert_bc_action_idx is not None and len(expert_bc_action_idx) == len(expert_top1_preds):
+                                    correct_predictions = np.sum(expert_top1_preds == expert_bc_action_idx)
+                                else:
+                                    # 回退到全局edge IDs比较
+                                    raise Exception('expert_bc_action_idx not found')
+                                    correct_predictions = np.sum(expert_top1_preds == expert_action_ids)
                                 total_samples = len(expert_action_ids)
                             else:
                                 # 如果expert_state不可用，回退到旧方法（可能不准确）
+                                raise Exception('expert_state not found')
                                 correct_predictions = np.sum(top1_preds[:len(expert_action_ids)] == expert_action_ids) if len(top1_preds) >= len(expert_action_ids) else 0
                                 total_samples = len(expert_action_ids) if 'expert_action_ids' in locals() else 0
                         else:
                             # Phase-1: 使用全部数据（都是expert数据）
-                            correct_predictions = np.sum(top1_preds == action_ids)
+                            # 对于新架构，比较候选边索引而不是全局edge IDs
+                            if bc_action_idx_batch is not None and len(bc_action_idx_batch) == len(top1_preds):
+                                # 使用BC索引作为ground truth（候选边空间）
+                                correct_predictions = np.sum(top1_preds == bc_action_idx_batch)
+                                print(f"  [DEBUG] Training accuracy calculation: correct={correct_predictions}/{len(bc_action_idx_batch)}, bc_action_idx_batch[:5]={bc_action_idx_batch[:5]}, top1_preds[:5]={top1_preds[:5]}")
+                            else:
+                                # 回退到旧方法（全局edge IDs）- 仅用于兼容性
+                                raise Exception('bc_action_idx_batch not found')
+                                correct_predictions = np.sum(top1_preds == action_ids)
                             total_samples = len(action_ids)
                         
                         # 计算accuracy
                         accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
+
+                        # 调试：检查数据质量
+                        if global_step <= 50:  # 只在初期打印
+                            print(f"  [DEBUG] Data quality check:")
+                            print(f"    bc_action_idx_batch shape: {bc_action_idx_batch.shape if bc_action_idx_batch is not None else 'None'}")
+                            print(f"    bc_action_idx_batch sample: {bc_action_idx_batch[:10] if bc_action_idx_batch is not None else 'None'}")
+                            print(f"    top1_preds sample: {top1_preds[:10]}")
+                            print(f"    action_ids sample: {action_ids[:10]}")
+                            print(f"    cand_edge_ids_batch[0] length: {len(cand_edge_ids_batch[0]) if cand_edge_ids_batch else 'None'}")
                         avg_reward = np.mean(reward) if reward else 0.0
                         
                         # Log all loss components (always log to file, but only print detailed stats at log_frequency)
@@ -3675,7 +4028,7 @@ if __name__ == '__main__':
                         
                         # 打印训练统计信息（只在log_frequency时打印）
                         if global_step % args.log_frequency == 0:
-                            print(f"\n📊 Training Stats (Step {global_step}):")
+                            print(f"\n Training Stats (Step {global_step}):")
                             print(f" Current Time is {time.strftime('%Y-%m-%d %H:%M:%S')}")
                             print(f"  Loss: {total_loss:.4f} | Accuracy: {accuracy:.4f} ({correct_predictions}/{total_samples})")
                             if reward_stats:
@@ -3690,17 +4043,17 @@ if __name__ == '__main__':
                     if global_step == args.phase1_sl_only_steps:
                         print(f"\nPHASE TRANSITION: Phase1-SL-Only → Phase2-SL+RL (Step {global_step})")
                                     
-                    # 🔥 标准评估 (SL/RL通用评估)
+                    #  标准评估 (SL/RL通用评估)
                     if global_step % args.eval_frequency == 0:                  
                         print(f"\n{'='*60}")
                         print(f"🔍 EVALUATION at step {global_step}")
                         print(f"{'='*60}")
                         
-                        # 🔥 Stage-1: Skip RL evaluations to reduce computational cost
+                        #  Stage-1: Skip RL evaluations to reduce computational cost
                         is_stage1 = (global_step <= args.phase1_sl_only_steps)
                         
                         if is_stage1:
-                            print(f"🎯 Stage-1: SL-only evaluation (skipping RL metrics)")
+                            print(f" Stage-1: SL-only evaluation (skipping RL metrics)")
                             # Only run basic SL evaluation
                             train_metrics = batch_evaluate_improved(sess, QN_1, dataset='train', logger=logger, step=global_step, 
                                                                 training_phase=1, rl_weight=0.0, batch_size=args.batch_size, rl_rollout_sample_size=0, G=G, edge_id_map=edge_id_map, item_num=item_num, reward_goal=reward_goal, target_model=QN_2,
@@ -3714,9 +4067,9 @@ if __name__ == '__main__':
                                                             use_text_embeddings=args.use_text_embeddings, text_embedding_loader=text_embedding_loader, 
                                                             embedding_proj_weights=embedding_proj_weights, embedding_proj_biases=embedding_proj_biases, feature_dim=feature_dim,
                                                             data_directory=data_directory, user_id=args.user_id, moe_data_dir=args.moe_data_dir, graph_id=args.graph_id)
-                            # 🔥 修复：如果val数据集不存在，跳过val评估
+                            #  修复：如果val数据集不存在，跳过val评估
                             if val_metrics is None:
-                                print(f"⚠️  Skipping VAL evaluation (dataset not found)")
+                                print(f"  Skipping VAL evaluation (dataset not found)")
                         else:
                             train_metrics = batch_evaluate_improved(sess, QN_1, dataset='train', logger=logger, step=global_step, 
                                                                 training_phase=current_phase, rl_weight=rl_weight, batch_size=args.batch_size, rl_rollout_sample_size=50, G=G, edge_id_map=edge_id_map, item_num=item_num, reward_goal=reward_goal, target_model=QN_2,
@@ -3730,11 +4083,11 @@ if __name__ == '__main__':
                                                             use_text_embeddings=args.use_text_embeddings, text_embedding_loader=text_embedding_loader, 
                                                             embedding_proj_weights=embedding_proj_weights, embedding_proj_biases=embedding_proj_biases, feature_dim=feature_dim,
                                                             data_directory=data_directory, user_id=args.user_id, moe_data_dir=args.moe_data_dir, graph_id=args.graph_id)
-                            # 🔥 修复：如果val数据集不存在，跳过val评估
+                            #  修复：如果val数据集不存在，跳过val评估
                             if val_metrics is None:
-                                print(f"⚠️  Skipping VAL evaluation (dataset not found)")
+                                print(f"  Skipping VAL evaluation (dataset not found)")
                         
-                        # 🔥 Early stopping check (only if enabled and val_metrics exists)
+                        #  Early stopping check (only if enabled and val_metrics exists)
                         if args.early_stopping and val_metrics is not None:
                             current_epoch = (global_step - training_start_step) / num_batches
                             
@@ -3748,7 +4101,7 @@ if __name__ == '__main__':
                                 
                                 if improvement > args.early_stopping_min_delta:
                                     # Improvement detected
-                                    print(f"✅ Early Stopping: Improvement detected!")
+                                    print(f" Early Stopping: Improvement detected!")
                                     print(f"   Metric ({args.early_stopping_metric}): {best_val_metric:.6f} → {current_val_metric:.6f} (+{improvement:.6f})")
                                     
                                     best_val_metric = current_val_metric
@@ -3765,7 +4118,7 @@ if __name__ == '__main__':
                                 else:
                                     # No improvement
                                     patience_counter += 1
-                                    print(f"⚠️  Early Stopping: No improvement")
+                                    print(f"  Early Stopping: No improvement")
                                     print(f"   Metric ({args.early_stopping_metric}): {current_val_metric:.6f} (best: {best_val_metric:.6f})")
                                     print(f"   Patience: {patience_counter}/{args.early_stopping_patience}")
                                     
@@ -3780,27 +4133,27 @@ if __name__ == '__main__':
                                         early_stop_triggered = True
                                         break  # Exit the inner loop (batches)
                             else:
-                                print(f"ℹ️  Early Stopping: Waiting until epoch {args.early_stopping_start_epoch} (current: {current_epoch:.1f})")
+                                print(f"  Early Stopping: Waiting until epoch {args.early_stopping_start_epoch} (current: {current_epoch:.1f})")
                         
                         print(f"{'='*60}\n")
                 
-                # 🔥 Check if early stopping was triggered (exit outer epoch loop)
+                #  Check if early stopping was triggered (exit outer epoch loop)
                 if early_stop_triggered:
                     break
                 
-        # 🔥 Load best model if early stopping was triggered
+        #  Load best model if early stopping was triggered
         if args.early_stopping and early_stop_triggered and best_model_path:
             print(f"\n{'='*60}")
-            print(f"🔄 Loading best model for final evaluation")
+            print(f" Loading best model for final evaluation")
             print(f"{'='*60}")
             print(f"   Best model step: {best_model_step}")
             print(f"   Best {args.early_stopping_metric}: {best_val_metric:.6f}")
             print(f"   Loading from: {best_model_path}")
             try:
                 saver.restore(sess, best_model_path)
-                print(f"   ✅ Best model loaded successfully")
+                print(f"    Best model loaded successfully")
             except Exception as e:
-                print(f"   ⚠️  Failed to load best model: {e}")
+                print(f"     Failed to load best model: {e}")
                 print(f"   Will use current model for final evaluation")
             print(f"{'='*60}\n")
         
@@ -3811,8 +4164,8 @@ if __name__ == '__main__':
             print("(Using best model from early stopping)")
         print("="*60)
         print("\nTest set evaluation:")
-        # 🔥 始终执行test集的完整评估（显示A.单步准确率, B.Reach@B, C.路径准确率/覆盖度）
-        print(f"\n🔥 Final TEST dataset evaluation with complete metrics...")
+        #  始终执行test集的完整评估（显示A.单步准确率, B.Reach@B, C.路径准确率/覆盖度）
+        print(f"\n Final TEST dataset evaluation with complete metrics...")
         test_metrics = batch_evaluate_improved(sess, QN_1, dataset='test', logger=logger, step=global_step,
                                             training_phase=current_phase, rl_weight=rl_weight, batch_size=args.batch_size, 
                                             sample_ratio=1.0,  # 使用全量test集
@@ -3833,26 +4186,26 @@ if __name__ == '__main__':
             saver.save(sess, final_checkpoint_path)
             print(f"\nFinal model saved: {final_checkpoint_path}")
             
-            # 🔥 Print early stopping summary
+            #  Print early stopping summary
             if args.early_stopping:
                 print(f"\n{'='*60}")
-                print(f"📊 Early Stopping Summary")
+                print(f" Early Stopping Summary")
                 print(f"{'='*60}")
                 if early_stop_triggered:
-                    print(f"   Status: ✅ Triggered at step {global_step}")
+                    print(f"   Status:  Triggered at step {global_step}")
                     print(f"   Best model: {best_model_path}")
                     print(f"   Best {args.early_stopping_metric}: {best_val_metric:.6f}")
                     print(f"   Best model step: {best_model_step}")
                     print(f"   Epochs saved: ~{(global_step - best_model_step) / num_batches:.1f}")
                 else:
-                    print(f"   Status: ❌ Not triggered (training completed normally)")
+                    print(f"   Status:  Not triggered (training completed normally)")
                     print(f"   Best {args.early_stopping_metric}: {best_val_metric:.6f}")
                     print(f"   Best model step: {best_model_step}")
                 print(f"{'='*60}")
         else:
             print("\n🔍 Eval-only mode: Skipping log and model saving (evaluation complete)")
         
-        # 🔥 清理 evaluation_cache 缓存（只删除当前进程的缓存文件）
+        #  清理 evaluation_cache 缓存（只删除当前进程的缓存文件）
         print(f"\n{'='*60}")
         print("CLEANING UP EVALUATION CACHE")
         print(f"{'='*60}")
@@ -3874,14 +4227,14 @@ if __name__ == '__main__':
                             deleted_count += 1
                             deleted_size += file_size
                         except Exception as e:
-                            print(f"⚠️  Failed to delete {filename}: {e}")
+                            print(f"  Failed to delete {filename}: {e}")
 
                 if deleted_count > 0:
-                    print(f"✅ Cleaned {deleted_count} cache files for current process ({deleted_size / (1024*1024):.2f} MB)")
+                    print(f" Cleaned {deleted_count} cache files for current process ({deleted_size / (1024*1024):.2f} MB)")
                 else:
-                    print("ℹ️  No cache files found for current process")
+                    print("  No cache files found for current process")
             except Exception as e:
-                print(f"⚠️  Failed to clean evaluation cache: {e}")
+                print(f"  Failed to clean evaluation cache: {e}")
         else:
-            print(f"ℹ️  No evaluation cache found at: {cache_dir}")
+            print(f"  No evaluation cache found at: {cache_dir}")
         print(f"{'='*60}\n") 

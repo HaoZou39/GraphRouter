@@ -69,7 +69,7 @@ class FeatureBuilder:
         goal_coord = self.graph_cache.node_coords[goal_node_id]
 
         # 计算参考方向
-        if prev_node_id is not None:
+        if prev_node_id is not None and not (isinstance(prev_node_id, float) and np.isnan(prev_node_id)):
             prev_coord = self.graph_cache.node_coords[prev_node_id]
             ref_vec = np.array([cur_coord[0] - prev_coord[0],
                                cur_coord[1] - prev_coord[1]])

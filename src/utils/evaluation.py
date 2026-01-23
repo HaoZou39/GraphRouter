@@ -264,6 +264,11 @@ def build_path_data_for_batch(group, state_size=10, edge_id_map=None, graph_cach
     path_user_ids = []  # 🔥 新增：收集user_id标签
     path_cand_edges = []  # 🔥 新增：收集每步的候选边
     path_bc_indices = []  # 🔥 新增：收集每步的BC索引
+    path_cur_node_ids = []  # 🔥 新增：收集每步的当前节点ID
+    path_goal_node_ids = []  # 🔥 新增：收集每步的目标节点ID
+    path_d_starts = []  # 🔥 新增：收集每步的起始距离
+    path_prev_node_ids = []  # 🔥 新增：收集每步的前一个节点ID
+    path_recent_visited = []  # 🔥 新增：收集每步的最近访问节点
     history = []
     history_edge_ids = []  # 新格式：跟踪历史edge_ids
     initial_state = None
@@ -279,17 +284,43 @@ def build_path_data_for_batch(group, state_size=10, edge_id_map=None, graph_cach
         if is_new_format:
             # 新格式：需要构建历史序列
             action_edge_id = row.get('action_edge_id', 0)
-            cur_node_id = row.get('cur_node_id')
+            cur_node_id_raw = row.get('cur_node_id')
+            # 处理可能的nan值
+            cur_node_id = None if (cur_node_id_raw is None or
+                                 (isinstance(cur_node_id_raw, float) and np.isnan(cur_node_id_raw))) else int(cur_node_id_raw)
             
             # 🔥 获取当前步的候选边
             cand_edge_ids = graph_cache.get_candidate_edges(cur_node_id)
             path_cand_edges.append(cand_edge_ids)
-            
+
             # 🔥 找到action在候选边中的索引（BC index）
             bc_action_idx = None
             if action_edge_id in cand_edge_ids:
                 bc_action_idx = cand_edge_ids.index(action_edge_id)
             path_bc_indices.append(bc_action_idx)
+
+            # 🔥 收集节点信息用于候选边特征重建
+            goal_node_id_raw = row.get('goal_node_id')
+            # 处理可能的nan值
+            goal_node_id = None if (goal_node_id_raw is None or
+                                  (isinstance(goal_node_id_raw, float) and np.isnan(goal_node_id_raw))) else int(goal_node_id_raw)
+            d_start = row.get('d_start', 100.0)
+            prev_node_id_raw = row.get('prev_node_id')
+            # 将nan值转换为None
+            prev_node_id = None if (prev_node_id_raw is None or
+                                  (isinstance(prev_node_id_raw, float) and np.isnan(prev_node_id_raw))) else prev_node_id_raw
+            recent_visited_nodes_raw = row.get('recent_visited_nodes', [])
+            # 处理可能的nan值和None值
+            if recent_visited_nodes_raw is None or (isinstance(recent_visited_nodes_raw, float) and np.isnan(recent_visited_nodes_raw)):
+                recent_visited_nodes = []
+            else:
+                recent_visited_nodes = recent_visited_nodes_raw
+
+            path_cur_node_ids.append(cur_node_id)
+            path_goal_node_ids.append(goal_node_id)
+            path_d_starts.append(d_start)
+            path_prev_node_ids.append(prev_node_id)
+            path_recent_visited.append(recent_visited_nodes)
             
             # 构建历史序列（使用 feature_builder）
             # 对于历史边，使用静态特征（prev_node_id和recent_visited_nodes设为None）
@@ -313,7 +344,7 @@ def build_path_data_for_batch(group, state_size=10, edge_id_map=None, graph_cach
             path_len_states.append(min(len(history_edge_ids), _state_size))
             
             path_actions.append(action_edge_id)
-            
+
             user_id = row.get('user_id', 0)
             if not isinstance(user_id, (int, np.integer)):
                 try:
@@ -321,7 +352,6 @@ def build_path_data_for_batch(group, state_size=10, edge_id_map=None, graph_cach
                 except (ValueError, TypeError):
                     user_id = 0
             path_user_ids.append(user_id)
-            
             # 更新历史
             history_edge_ids.append(action_edge_id)
             continue  # 跳过旧格式的处理逻辑
@@ -384,15 +414,10 @@ def build_path_data_for_batch(group, state_size=10, edge_id_map=None, graph_cach
                 user_id = 0
         path_user_ids.append(user_id)
         
-        # 🔥 旧格式：填充空的候选边和BC索引（向后兼容）
-        if not is_new_format:
-            path_cand_edges.append([])
-            path_bc_indices.append(None)
-        
         if 'feature_vec' in row:
             history.append(row['feature_vec'])
     
-    return path_states, path_actions, path_len_states, len(path_actions), path_user_ids, path_cand_edges, path_bc_indices
+    return path_states, path_actions, path_len_states, len(path_actions), path_user_ids, path_cand_edges, path_bc_indices, path_cur_node_ids, path_goal_node_ids, path_d_starts, path_prev_node_ids, path_recent_visited
 
 def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, training_phase=1, rl_weight=0.0, batch_size=64, sample_ratio=1.0, rl_rollout_sample_size=100, G=None, edge_id_map=None, item_num=None, reward_goal=None, target_model=None, eval_num_trials=5, eval_temperature=1.0,
                             use_text_embeddings=False, text_embedding_loader=None, embedding_proj_weights=None, embedding_proj_biases=None, feature_dim=15,
@@ -443,7 +468,8 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
     # 直接用进程ID避免同时运行多个任务时的缓存冲突
     import os
     task_suffix = f'_p{os.getpid()}'
-    cache_file = os.path.join(cache_dir, f'{dataset}_batch_data{cache_suffix}_s{state_size}{config_suffix}{user_embedding_suffix}{task_suffix}.pkl')
+    graph_suffix = f'_g{graph_id}' if graph_id != 'default_graph' else ''  # 只在非默认图时添加图ID
+    cache_file = os.path.join(cache_dir, f'{dataset}_batch_data{cache_suffix}_s{state_size}{config_suffix}{user_embedding_suffix}{graph_suffix}{task_suffix}.pkl')
 
     # 尝试加载缓存数据
     cache_valid = False
@@ -471,6 +497,12 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
                             # 🔥 新增：加载候选边和BC索引（如果存在，兼容旧缓存）
                             all_cand_edges = cached_data.get('cand_edges', [[]] * len(all_path_data))
                             all_bc_indices = cached_data.get('bc_indices', [None] * len(all_path_data))
+                            # 🔥 新增：加载节点信息（如果存在，兼容旧缓存）
+                            all_cur_node_ids = cached_data.get('cur_node_ids', [None] * len(all_path_data))
+                            all_goal_node_ids = cached_data.get('goal_node_ids', [None] * len(all_path_data))
+                            all_d_starts = cached_data.get('d_starts', [100.0] * len(all_path_data))
+                            all_prev_node_ids = cached_data.get('prev_node_ids', [None] * len(all_path_data))
+                            all_recent_visited = cached_data.get('recent_visited', [[]] * len(all_path_data))
                             cache_valid = True
                             print(f'✅ Loaded cached evaluation data (state_size={state_size}, dim={cached_state_dim})')
                         else:
@@ -483,7 +515,34 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             print(f'Failed to load cache: {e}, rebuilding data...')
     else:
         print(f'No cache found for {dataset} dataset, building data...')
-    
+
+    # 🔥 加载 graph_cache 和 feature_builder（用于新格式数据）
+    # 即使命中缓存也需要加载，因为后续评估逻辑需要这些对象
+    graph_cache = None
+    global_feature_builder = None  # 使用不同的变量名避免作用域冲突
+    try:
+        from utils.graph_cache import MultiGraphCache
+        multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
+        graph_cache = multi_cache.get_cache(graph_id)
+        global_feature_builder = multi_cache.get_feature_builder(graph_id)
+        print(f'✅ Loaded GraphCache and FeatureBuilder for graph "{graph_id}"')
+    except Exception as e:
+        print(f'⚠️  Could not load GraphCache/FeatureBuilder: {e}')
+        print(f'   Assuming old format data (with feature_vec)')
+        raise Exception(f'Could not load GraphCache/FeatureBuilder: {e}')
+
+    # 为后续使用设置别名
+    feature_builder = global_feature_builder
+
+    # 初始化节点信息变量（用于缓存兼容性）
+    if not cache_valid:
+        # 缓存无效时，这些变量会在数据重建过程中设置
+        all_cur_node_ids = []
+        all_goal_node_ids = []
+        all_d_starts = []
+        all_prev_node_ids = []
+        all_recent_visited = []
+
     # 如果没有缓存或加载失败，重新构建数据
     if not cache_valid:
         # 初始化all_path_user_ids（如果从缓存加载失败）
@@ -521,19 +580,6 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
         print(f'Start batch evaluating {dataset.upper()} dataset...')
         print(f'Dataset size: {len(eval_ids)} paths, Batch size: {batch_size}')
         
-        # 加载 graph_cache 和 feature_builder（用于新格式数据）
-        graph_cache = None
-        feature_builder = None
-        try:
-            from utils.graph_cache import MultiGraphCache
-            multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
-            graph_cache = multi_cache.get_cache(graph_id)
-            feature_builder = multi_cache.get_feature_builder(graph_id)
-            print(f'✅ Loaded GraphCache and FeatureBuilder for graph "{graph_id}"')
-        except Exception as e:
-            print(f'⚠️  Could not load GraphCache/FeatureBuilder: {e}')
-            print(f'   Assuming old format data (with feature_vec)')
-        
         # 预计算所有路径数据
         all_path_data = []
         all_path_actions = []
@@ -542,6 +588,11 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
         all_path_user_ids = []  # 🔥 新增：收集所有user_id标签
         all_cand_edges = []  # 🔥 新增：收集所有候选边
         all_bc_indices = []  # 🔥 新增：收集所有BC索引
+        all_cur_node_ids = []  # 🔥 新增：收集所有当前节点ID
+        all_goal_node_ids = []  # 🔥 新增：收集所有目标节点ID
+        all_d_starts = []  # 🔥 新增：收集所有起始距离
+        all_prev_node_ids = []  # 🔥 新增：收集所有前一个节点ID
+        all_recent_visited = []  # 🔥 新增：收集所有最近访问节点
         
         for route_id in eval_ids:
             group = eval_sessions[eval_sessions['route_id'] == route_id]
@@ -551,9 +602,9 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             # 构建路径数据
             # 🔥 修复：需要传递state_size和edge_id_map参数
             # state_size应该与模型的state_size匹配，使用传入的state_size参数
-            path_states, path_actions, path_len_states, path_length, path_user_ids, path_cand_edges, path_bc_indices = build_path_data_for_batch(
+            path_states, path_actions, path_len_states, path_length, path_user_ids, path_cand_edges, path_bc_indices, path_cur_node_ids, path_goal_node_ids, path_d_starts, path_prev_node_ids, path_recent_visited = build_path_data_for_batch(
                 group, state_size=state_size, edge_id_map=edge_id_map,
-                graph_cache=graph_cache, feature_builder=feature_builder
+                graph_cache=graph_cache, feature_builder=global_feature_builder
             )
             all_path_data.extend(path_states)
             all_path_actions.extend(path_actions)
@@ -562,6 +613,11 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             all_path_user_ids.extend(path_user_ids)  # 🔥 新增：收集user_id
             all_cand_edges.extend(path_cand_edges)  # 🔥 新增：收集候选边
             all_bc_indices.extend(path_bc_indices)  # 🔥 新增：收集BC索引
+            all_cur_node_ids.extend(path_cur_node_ids)  # 🔥 新增：收集当前节点ID
+            all_goal_node_ids.extend(path_goal_node_ids)  # 🔥 新增：收集目标节点ID
+            all_d_starts.extend(path_d_starts)  # 🔥 新增：收集起始距离
+            all_prev_node_ids.extend(path_prev_node_ids)  # 🔥 新增：收集前一个节点ID
+            all_recent_visited.extend(path_recent_visited)  # 🔥 新增：收集最近访问节点
         
         print(f'Precomputed {len(all_path_data)} states')
         
@@ -575,6 +631,11 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
                 'path_user_ids': all_path_user_ids,  # 🔥 新增：保存user_id
                 'cand_edges': all_cand_edges,  # 🔥 新增：保存候选边
                 'bc_indices': all_bc_indices,  # 🔥 新增：保存BC索引
+                'cur_node_ids': all_cur_node_ids,  # 🔥 新增：保存当前节点ID
+                'goal_node_ids': all_goal_node_ids,  # 🔥 新增：保存目标节点ID
+                'd_starts': all_d_starts,  # 🔥 新增：保存起始距离
+                'prev_node_ids': all_prev_node_ids,  # 🔥 新增：保存前一个节点ID
+                'recent_visited': all_recent_visited,  # 🔥 新增：保存最近访问节点
                 'eval_ids': eval_ids,
                 'state_size': state_size  # 🔥 新增：保存state_size用于验证
             }
@@ -683,6 +744,15 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
         batch_len_states = all_path_len_states[i:i+batch_size]
         # 🔥 提取当前批次的user_ids
         batch_user_ids = all_path_user_ids[i:i+batch_size] if all_path_user_ids else [0] * len(batch_states)
+        # 🔥 提取当前批次的候选边和BC索引
+        batch_cand_edges = all_cand_edges[i:i+batch_size] if all_cand_edges else [None] * len(batch_states)
+        batch_bc_indices = all_bc_indices[i:i+batch_size] if all_bc_indices else [None] * len(batch_states)
+        # 🔥 提取当前批次的节点信息（现在这些变量始终存在）
+        batch_cur_node_ids = all_cur_node_ids[i:i+batch_size] if all_cur_node_ids else [None] * len(batch_states)
+        batch_goal_node_ids = all_goal_node_ids[i:i+batch_size] if all_goal_node_ids else [None] * len(batch_states)
+        batch_d_starts = all_d_starts[i:i+batch_size] if all_d_starts else [100.0] * len(batch_states)
+        batch_prev_node_ids = all_prev_node_ids[i:i+batch_size] if all_prev_node_ids else [None] * len(batch_states)
+        batch_recent_visited = all_recent_visited[i:i+batch_size] if all_recent_visited else [[]] * len(batch_states)
         
         # 🔥 修复：检查模型期望的特征维度，如果模型期望增强特征（model.feature_dim > feature_dim），
         # 则必须增强数据，即使 use_text_embeddings=False
@@ -740,9 +810,98 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             
             batch_masks = generate_action_mask_batch(batch_states_for_mask, G, edge_id_map, item_num, debug_output=True)
 
+        # 🔥 准备候选边特征数据（用于新格式SL推理）
+        batch_cand_features = None
+        batch_cand_masks = None
+        # 使用全局变量，避免作用域问题
+        if global_feature_builder is not None and batch_cand_edges:
+            # 为当前批次准备候选边特征
+            batch_cand_features_list = []
+            batch_cand_masks_list = []
+
+            for step_idx, step_cand_edges in enumerate(batch_cand_edges):
+                if step_cand_edges and len(step_cand_edges) > 0:
+                    # 使用真实的节点信息重建候选边特征
+                    cur_node_id = batch_cur_node_ids[step_idx]
+                    goal_node_id = batch_goal_node_ids[step_idx]
+                    d_start = batch_d_starts[step_idx]
+                    prev_node_id = batch_prev_node_ids[step_idx]
+                    recent_visited_nodes = batch_recent_visited[step_idx]
+
+                    if cur_node_id is not None and goal_node_id is not None and global_feature_builder is not None:
+                        # 调试：检查节点是否存在于图中
+                        if cur_node_id not in graph_cache.node_coords:
+                            raise ValueError(f"Current node {cur_node_id} does not exist in graph {graph_id} for step {step_idx}. "
+                                           f"Available nodes: {len(graph_cache.node_coords)} total, "
+                                           f"max ID: {max(graph_cache.node_coords.keys()) if graph_cache.node_coords else 'N/A'}")
+                        if goal_node_id not in graph_cache.node_coords:
+                            raise ValueError(f"Goal node {goal_node_id} does not exist in graph for step {step_idx}. "
+                                           f"Available nodes: {len(graph_cache.node_coords)} total, "
+                                           f"max ID: {max(graph_cache.node_coords.keys()) if graph_cache.node_coords else 'N/A'}")
+
+                        # 调试：检查候选边是否都存在
+                        missing_edges = []
+                        for edge_id in step_cand_edges:
+                            # 这里需要检查edge_id是否存在，取决于graph_cache的API
+                            pass  # 暂时跳过，后面再检查
+
+                        # 重建真实的候选边特征（必须成功，不能使用默认值）
+                        try:
+                            cand_features = global_feature_builder.build_candidate_features(
+                                cand_edge_ids=step_cand_edges,
+                                cur_node_id=cur_node_id,
+                                goal_node_id=goal_node_id,
+                                d_start=d_start,
+                                prev_node_id=prev_node_id,
+                                recent_visited_nodes=recent_visited_nodes
+                            )
+                        except Exception as e:
+                            # 提供详细的错误信息
+                            raise ValueError(f"Failed to build candidate features for step {step_idx}: {str(e)}. "
+                                           f"cur_node_id={cur_node_id}, goal_node_id={goal_node_id}, "
+                                           f"cand_edge_ids={step_cand_edges[:5]}..., d_start={d_start}")
+
+                        # 检查是否有nan值
+                        if np.any(np.isnan(cand_features)):
+                            raise ValueError(f"Candidate features contain NaN values for step {step_idx}. "
+                                           f"Feature stats: min={np.nanmin(cand_features):.3f}, "
+                                           f"max={np.nanmax(cand_features):.3f}, "
+                                           f"mean={np.nanmean(cand_features):.3f}")
+                    else:
+                        # 如果没有节点信息，必须报错，不能使用默认特征
+                        raise ValueError(f"Missing required data for candidate feature reconstruction at step {step_idx}: "
+                                       f"cur_node_id={cur_node_id}, goal_node_id={goal_node_id}, "
+                                       f"feature_builder={global_feature_builder is not None}")
+
+                    cand_mask = np.ones(len(step_cand_edges), dtype=np.float32)
+                else:
+                    raise 
+                    # 没有候选边信息，创建默认特征
+                    cand_features = np.zeros((model.max_candidates, 12), dtype=np.float32)
+                    # 为默认候选边创建基本特征
+                    for i in range(model.max_candidates):
+                        cand_features[i, 0] = float(i) / float(model.max_candidates)  # 位置编码
+                        cand_features[i, 2] = 1.0  # 默认长度
+                        cand_features[i, 3] = 0.5  # 默认宽度
+                    cand_mask = np.zeros(model.max_candidates, dtype=np.float32)
+
+                batch_cand_features_list.append(cand_features)
+                batch_cand_masks_list.append(cand_mask)
+
+            if batch_cand_features_list:
+                # 填充到模型期望的固定大小 [batch_size, max_candidates, feature_dim]
+                batch_cand_features = np.zeros((len(batch_states), model.max_candidates, 12), dtype=np.float32)
+                batch_cand_masks = np.zeros((len(batch_states), model.max_candidates), dtype=np.float32)
+
+                for j, (cf, cm) in enumerate(zip(batch_cand_features_list, batch_cand_masks_list)):
+                    # 截断到模型的最大候选边数量
+                    actual_len = min(len(cf), model.max_candidates)
+                    batch_cand_features[j, :actual_len] = cf[:actual_len]
+                    batch_cand_masks[j, :actual_len] = cm[:actual_len]
+
         # 为评估创建虚拟的potential_labels（评估时不需要真实标签）
         dummy_potential_labels = np.zeros((len(batch_states), 1), dtype=np.float32)
-        
+
         # SL head prediction (softmax probability)
         # 🔥 构建基础feed_dict
         base_feed_dict = {
@@ -753,6 +912,11 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             model.training_phase: training_phase,
             model.rl_weight: rl_weight
         }
+
+        # 🔥 添加候选边特征（如果有的话）
+        if batch_cand_features is not None and hasattr(model, 'cand_features'):
+            base_feed_dict[model.cand_features] = batch_cand_features
+            base_feed_dict[model.cand_mask] = batch_cand_masks
         
         # 🔥 如果模型有user_id_ph占位符（PersonalizedQNetwork且为lora模式），需要提供user_id
         if hasattr(model, 'user_id_ph') and model.user_id_ph is not None:
@@ -783,13 +947,29 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
                 batch_user_ids_eval = np.zeros(batch_size, dtype=np.int32)
             base_feed_dict[model.user_id_ph] = batch_user_ids_eval
         
-        # 🔥 调试：检查模型输出
+        # 🔥 SL head prediction
+        # 现在模型直接输出候选边空间的预测
         if hasattr(model, 'probs_personalized'):
             # 个性化模型：使用个性化输出
             batch_preds = sess.run(model.probs_personalized, feed_dict=base_feed_dict)
         else:
-            # 基础模型：使用标准输出
+            # 基础模型：直接输出候选边空间的预测
             batch_preds = sess.run(model.probs, feed_dict=base_feed_dict)
+
+        # 🔥 后处理：确保预测与候选边数量匹配
+        processed_preds = []
+        for j, step_cand_edges in enumerate(batch_cand_edges):
+            if step_cand_edges and len(step_cand_edges) > 0:
+                # 模型输出已经是候选边空间，直接使用对应数量的预测
+                num_cand = min(len(step_cand_edges), model.max_candidates)
+                cand_scores = batch_preds[j][:num_cand]
+                processed_preds.append(cand_scores)
+            else:
+                # 如果没有候选边信息，使用预测的前N个分数
+                max_cand = getattr(model, 'max_candidates', 20)
+                processed_preds.append(batch_preds[j][:max_cand])
+        # 🔥 修复警告：使用 dtype=object 处理不规则嵌套序列
+        batch_preds = np.array(processed_preds, dtype=object)
         
         # RL head prediction (Q values)
         if hasattr(model, 'output1_personalized_masked'):
@@ -800,15 +980,19 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             batch_rl_q = sess.run(model.output1_masked, feed_dict=base_feed_dict)
         
 
-        # 新增：监控有效动作的Q-values
+        # 新增：监控有效动作的Q-values（现在使用候选边空间）
         for j in range(len(batch_rl_q)):
-            valid_mask = batch_masks[j] > 0
+            if batch_cand_masks is not None:
+                valid_mask = batch_cand_masks[j] > 0
+            else:
+                raise ValueError("No candidate masks found for evaluation")
+                # 如果没有候选边mask，假设所有候选边都有效
+                valid_mask = np.ones(model.max_candidates, dtype=bool)
             valid_q_values = batch_rl_q[j][valid_mask]
             if len(valid_q_values) > 0:
                 all_valid_q_values.extend(valid_q_values)
                 all_valid_q_counts.append(len(valid_q_values))
 
-        # 🔥 获取top1预测：使用候选边索引而不是全局edge_id
         # 对于每个样本，我们需要找到在候选边中的最佳选择
         batch_start_idx = len(all_predictions)
         for j in range(len(batch_preds)):
@@ -816,25 +1000,17 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
             # 获取当前步的候选边
             step_cand_edges = all_cand_edges[step_idx]
             
-            # 如果有候选边信息（新格式），使用候选边索引计算准确率
+            # 现在SL输出已经是候选边空间，直接使用argmax得到候选索引
             if step_cand_edges and len(step_cand_edges) > 0:
-                # 提取候选边的分数
-                sl_cand_scores = batch_preds[j][step_cand_edges]
-                rl_cand_scores = batch_rl_q[j][step_cand_edges]
-                
-                # 在候选边中找到最高分的索引
-                pred_cand_idx = np.argmax(sl_cand_scores)
-                rl_pred_cand_idx = np.argmax(rl_cand_scores)
-                
+                # SL输出已经是候选边空间，直接找到最高分的索引
+                pred_cand_idx = np.argmax(batch_preds[j])  # batch_preds[j] 是 [max_candidates] 的概率分布
+                rl_pred_cand_idx = np.argmax(batch_rl_q[j])  # batch_rl_q[j] 也是 [max_candidates]
+
                 # 保存预测的候选索引（用于与bc_action_idx比较）
                 all_predictions.append(pred_cand_idx)
                 all_rl_predictions.append(rl_pred_cand_idx)
             else:
-                # 旧格式：直接使用全局argmax（向后兼容）
-                pred_edge_id = np.argmax(batch_preds[j])
-                rl_pred_edge_id = np.argmax(batch_rl_q[j])
-                all_predictions.append(pred_edge_id)
-                all_rl_predictions.append(rl_pred_edge_id)
+                raise ValueError("No candidate edges found for evaluation")
 
     # 🔥 计算SL head指标：对于新格式，比较候选索引；对于旧格式，比较edge_id
     total_steps = len(all_predictions)
@@ -1379,7 +1555,10 @@ def batch_evaluate_improved(sess, model, dataset='val', logger=None, step=None, 
         # 使用传入的data_directory参数，而不是硬编码
         reward_dir = os.path.join(data_directory, 'training_logs')
         os.makedirs(reward_dir, exist_ok=True)
-        
+
+        # 获取当前时间戳
+        current_time = time.time()
+
         # 准备详细的奖励数据
         detailed_reward_data = {
             'step': step,
