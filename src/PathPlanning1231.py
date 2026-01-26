@@ -75,6 +75,10 @@ def parse_args():
     parser.add_argument('--num_blocks', default=6, type=int, help='Number of blocks (for SASRec)')
     parser.add_argument('--dropout_rate', default=0.15, type=float, help='Dropout rate for regularization.')
     parser.add_argument('--max_candidates', type=int, default=20, help='Maximum candidates per step for candidate-based action selection') 
+    parser.add_argument('--use_gnn_embedding', action='store_true',
+                        help='Enable shared-weight GNN-style embeddings for current/goal nodes.')
+    parser.add_argument('--gnn_hidden_dim', type=int, default=32,
+                        help='Hidden dimension for GNN-style node embeddings.')
     
     # Training phase parameters - 两阶段训练策略
     parser.add_argument('--phase1_epochs', type=int, default=10,  # 第一阶段：纯SL训练的epoch数
@@ -211,7 +215,8 @@ def build_feed_dict(model, state, len_state, target_Qs, reward,
                    negative_actions=None, negative_rewards=None,
                    negative_target_Qs=None, negative_actor_target_probs=None, negative_loss_weight=0.0,
                    negative_loss_mask=None, actor_rl_weight=0.1, is_training=True,
-                   cand_features=None, cand_mask=None, bc_action_idx=None, rl_action_cand_idx=None):
+                   cand_features=None, cand_mask=None, bc_action_idx=None, rl_action_cand_idx=None,
+                   gnn_node_feat=None, gnn_neighbor_feat=None, gnn_goal_node_feat=None, gnn_goal_neighbor_feat=None):
     """
     Build universal feed_dict
     
@@ -270,6 +275,21 @@ def build_feed_dict(model, state, len_state, target_Qs, reward,
     if cand_features is not None and hasattr(model, 'cand_features'):
         feed_dict[model.cand_features] = cand_features
         feed_dict[model.cand_mask] = cand_mask if cand_mask is not None else np.ones_like(cand_features[:, :, 0])
+
+    if hasattr(model, 'gnn_node_feat'):
+        batch_size = len(state) if state is not None else 1
+        if gnn_node_feat is None:
+            gnn_node_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        if gnn_neighbor_feat is None:
+            gnn_neighbor_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        if gnn_goal_node_feat is None:
+            gnn_goal_node_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        if gnn_goal_neighbor_feat is None:
+            gnn_goal_neighbor_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        feed_dict[model.gnn_node_feat] = gnn_node_feat
+        feed_dict[model.gnn_neighbor_feat] = gnn_neighbor_feat
+        feed_dict[model.gnn_goal_node_feat] = gnn_goal_node_feat
+        feed_dict[model.gnn_goal_neighbor_feat] = gnn_goal_neighbor_feat
     
     #  Actor-Critic DDPG: Add actor_target_probs
     if actor_target_probs is not None:
@@ -314,8 +334,54 @@ def build_feed_dict(model, state, len_state, target_Qs, reward,
         feed_dict[model.negative_actor_target_probs] = np.zeros((batch_size, neg, model.max_candidates), dtype=np.float32)
         feed_dict[model.negative_loss_mask] = np.zeros((batch_size, neg), dtype=np.float32)  # 掩码为0，损失无效
 
+    if hasattr(model, 'gnn_node_feat'):
+        batch_size = len(state) if state is not None else 1
+        if gnn_node_feat is None:
+            gnn_node_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        if gnn_neighbor_feat is None:
+            gnn_neighbor_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        if gnn_goal_node_feat is None:
+            gnn_goal_node_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        if gnn_goal_neighbor_feat is None:
+            gnn_goal_neighbor_feat = np.zeros((batch_size, model.gnn_input_dim), dtype=np.float32)
+        feed_dict[model.gnn_node_feat] = gnn_node_feat
+        feed_dict[model.gnn_neighbor_feat] = gnn_neighbor_feat
+        feed_dict[model.gnn_goal_node_feat] = gnn_goal_node_feat
+        feed_dict[model.gnn_goal_neighbor_feat] = gnn_goal_neighbor_feat
 
     return feed_dict
+
+
+def build_gnn_batch_features(graph_cache, cur_node_ids, goal_node_ids, gnn_input_dim):
+    """
+    Build GNN-style node features and neighbor-mean features for current/goal nodes.
+    """
+    if graph_cache is None:
+        batch_size = len(cur_node_ids)
+        zeros = np.zeros((batch_size, gnn_input_dim), dtype=np.float32)
+        return zeros, zeros, zeros, zeros
+
+    cur_feats = []
+    cur_neigh_feats = []
+    goal_feats = []
+    goal_neigh_feats = []
+
+    for cur_id, goal_id in zip(cur_node_ids, goal_node_ids):
+        cur_feat = graph_cache.get_node_feature_vector(cur_id)
+        cur_neigh = graph_cache.get_neighbor_feature_mean(cur_id)
+        goal_feat = graph_cache.get_node_feature_vector(goal_id)
+        goal_neigh = graph_cache.get_neighbor_feature_mean(goal_id)
+        cur_feats.append(cur_feat)
+        cur_neigh_feats.append(cur_neigh)
+        goal_feats.append(goal_feat)
+        goal_neigh_feats.append(goal_neigh)
+
+    return (
+        np.stack(cur_feats).astype(np.float32),
+        np.stack(cur_neigh_feats).astype(np.float32),
+        np.stack(goal_feats).astype(np.float32),
+        np.stack(goal_neigh_feats).astype(np.float32),
+    )
 
 class OnPolicyRingBuffer:
     """
@@ -825,7 +891,9 @@ class OnPolicyRingBuffer:
             return False
 
 class ImprovedQNetwork:
-    def __init__(self, hidden_size, learning_rate, feature_dim, item_num, state_size, dropout_rate, num_heads, num_blocks, lr_2, neg=2, max_candidates=20, cand_feature_dim=12, name='ImprovedDQNetwork'):
+    def __init__(self, hidden_size, learning_rate, feature_dim, item_num, state_size, dropout_rate, num_heads, num_blocks,
+                 lr_2, neg=2, max_candidates=20, cand_feature_dim=12, use_gnn_embedding=False,
+                 gnn_hidden_dim=32, gnn_input_dim=5, name='ImprovedDQNetwork'):
         """
         ImprovedQNetwork V2: Support candidate-based action selection.
 
@@ -839,6 +907,9 @@ class ImprovedQNetwork:
         self.hidden_size = hidden_size
         self.feature_dim = int(feature_dim)
         self.cand_feature_dim = int(cand_feature_dim)  #  候选边特征维度
+        self.use_gnn_embedding = use_gnn_embedding
+        self.gnn_hidden_dim = int(gnn_hidden_dim)
+        self.gnn_input_dim = int(gnn_input_dim)
 
         # self.weight = weight
         self.dropout_rate = dropout_rate
@@ -911,6 +982,39 @@ class ImprovedQNetwork:
             # SL head使用正常版本，SL梯度正常反传
             self.states_hidden_for_q = tf.stop_gradient(self.states_hidden)   # RL不反传到编码器
             self.states_hidden_for_sl = self.states_hidden                     # SL正常反传
+            self.gnn_node_feat = tf.compat.v1.placeholder(tf.float32, [None, self.gnn_input_dim], name='gnn_node_feat')
+            self.gnn_neighbor_feat = tf.compat.v1.placeholder(tf.float32, [None, self.gnn_input_dim], name='gnn_neighbor_feat')
+            self.gnn_goal_node_feat = tf.compat.v1.placeholder(tf.float32, [None, self.gnn_input_dim], name='gnn_goal_node_feat')
+            self.gnn_goal_neighbor_feat = tf.compat.v1.placeholder(tf.float32, [None, self.gnn_input_dim], name='gnn_goal_neighbor_feat')
+
+            if self.use_gnn_embedding:
+                with tf.compat.v1.variable_scope('gnn_encoder'):
+                    gnn_self_w = tf.compat.v1.get_variable(
+                        'gnn_self_w', [self.gnn_input_dim, self.gnn_hidden_dim],
+                        initializer=tf.compat.v1.glorot_normal_initializer()
+                    )
+                    gnn_neigh_w = tf.compat.v1.get_variable(
+                        'gnn_neigh_w', [self.gnn_input_dim, self.gnn_hidden_dim],
+                        initializer=tf.compat.v1.glorot_normal_initializer()
+                    )
+                    gnn_bias = tf.compat.v1.get_variable(
+                        'gnn_bias', [self.gnn_hidden_dim],
+                        initializer=tf.compat.v1.zeros_initializer()
+                    )
+
+                    cur_gnn = tf.nn.relu(
+                        tf.matmul(self.gnn_node_feat, gnn_self_w) +
+                        tf.matmul(self.gnn_neighbor_feat, gnn_neigh_w) + gnn_bias
+                    )
+                    goal_gnn = tf.nn.relu(
+                        tf.matmul(self.gnn_goal_node_feat, gnn_self_w) +
+                        tf.matmul(self.gnn_goal_neighbor_feat, gnn_neigh_w) + gnn_bias
+                    )
+
+                cur_gnn_for_q = tf.stop_gradient(cur_gnn)
+                goal_gnn_for_q = tf.stop_gradient(goal_gnn)
+                self.states_hidden_for_q = tf.concat([self.states_hidden_for_q, cur_gnn_for_q, goal_gnn_for_q], axis=-1)
+                self.states_hidden_for_sl = tf.concat([self.states_hidden_for_sl, cur_gnn, goal_gnn], axis=-1)
 
             # Output layers - Q头输出Q值（线性，无激活函数）
             with tf.compat.v1.variable_scope('output1'):
@@ -958,19 +1062,20 @@ class ImprovedQNetwork:
                 sl_state_expanded = tf.expand_dims(self.states_hidden_for_sl, 1)
                 sl_state_tiled = tf.tile(sl_state_expanded, [1, self.max_candidates, 1])
 
-                # 融合SL状态表征和候选边特征： [batch, max_candidates, 2*hidden_size]
+                # 融合SL状态表征和候选边特征： [batch, max_candidates, hidden_size + gnn + hidden_size]
                 sl_combined_features = tf.concat([sl_state_tiled, sl_cand_processed], axis=-1)
 
-                # SL候选边分类： [batch, max_candidates, 2*hidden_size] -> [batch, max_candidates]
+                # SL候选边分类： [batch, max_candidates, hidden_size + gnn + hidden_size] -> [batch, max_candidates]
                 sl_final_weights = tf.compat.v1.get_variable('sl_final_weights',
-                    [2 * self.hidden_size, 1],
+                    [self.states_hidden_for_sl.get_shape().as_list()[-1] + self.hidden_size, 1],
                     initializer=tf.compat.v1.glorot_normal_initializer())
                 sl_final_biases = tf.compat.v1.get_variable('sl_final_biases',
                     [1],
                     initializer=tf.compat.v1.zeros_initializer())
 
                 self.output2_candidates = tf.squeeze(tf.matmul(
-                    tf.reshape(sl_combined_features, [-1, 2 * self.hidden_size]), sl_final_weights) + sl_final_biases)
+                    tf.reshape(sl_combined_features, [-1, sl_final_weights.get_shape().as_list()[0]]),
+                    sl_final_weights) + sl_final_biases)
                 self.output2_candidates = tf.reshape(self.output2_candidates, [-1, self.max_candidates])
 
                 # 应用候选边mask
@@ -999,19 +1104,20 @@ class ImprovedQNetwork:
                 state_expanded = tf.expand_dims(self.states_hidden_for_q, 1)
                 state_tiled = tf.tile(state_expanded, [1, self.max_candidates, 1])
 
-                # Combine: [batch, max_candidates, 2*hidden_size]
+                # Combine: [batch, max_candidates, hidden_size + gnn + hidden_size]
                 combined_features = tf.concat([state_tiled, cand_processed], axis=-1)
 
-                # Final candidate scoring: [batch, max_candidates, 2*hidden_size] -> [batch, max_candidates]
+                # Final candidate scoring: [batch, max_candidates, hidden_size + gnn + hidden_size] -> [batch, max_candidates]
                 final_weights = tf.compat.v1.get_variable('final_weights',
-                    [2 * self.hidden_size, 1],
+                    [self.states_hidden_for_q.get_shape().as_list()[-1] + self.hidden_size, 1],
                     initializer=tf.compat.v1.glorot_normal_initializer())
                 final_biases = tf.compat.v1.get_variable('final_biases',
                     [1],
                     initializer=tf.compat.v1.zeros_initializer())
 
                 self.output1_candidates = tf.squeeze(tf.matmul(
-                    tf.reshape(combined_features, [-1, 2 * self.hidden_size]), final_weights) + final_biases)
+                    tf.reshape(combined_features, [-1, final_weights.get_shape().as_list()[0]]),
+                    final_weights) + final_biases)
                 self.output1_candidates = tf.reshape(self.output1_candidates, [-1, self.max_candidates])
 
                 # Apply candidate mask
@@ -1641,6 +1747,9 @@ if __name__ == '__main__':
                            num_heads=args.num_heads, num_blocks=args.num_blocks, lr_2=args.lr_2, neg=args.neg,
                            max_candidates=args.max_candidates if hasattr(args, 'max_candidates') else 20,
                            cand_feature_dim=12,  #  候选边特征维度（12维）
+                           use_gnn_embedding=args.use_gnn_embedding,
+                           gnn_hidden_dim=args.gnn_hidden_dim,
+                           gnn_input_dim=5,
                            )
     QN_2 = ImprovedQNetwork(name='QN_2', hidden_size=args.hidden_factor, learning_rate=args.lr,
                            feature_dim=model_feature_dim, item_num=item_num, state_size=state_size,
@@ -1648,6 +1757,9 @@ if __name__ == '__main__':
                            num_heads=args.num_heads, num_blocks=args.num_blocks, lr_2=args.lr_2, neg=args.neg,
                            max_candidates=args.max_candidates if hasattr(args, 'max_candidates') else 20,
                            cand_feature_dim=12,  #  候选边特征维度（12维）
+                           use_gnn_embedding=args.use_gnn_embedding,
+                           gnn_hidden_dim=args.gnn_hidden_dim,
+                           gnn_input_dim=5,
                            )
     hard_update_ops = build_hard_update_ops(QN_1.train_vars, QN_2.train_vars)
     soft_update_ops = build_soft_update_ops(QN_1.train_vars, QN_2.train_vars, tau=0.001)  #  使用降低的tau
@@ -2948,6 +3060,18 @@ if __name__ == '__main__':
                     d_start_batch = extract_batch_field(batch.get('d_start', [100.0] * len(cand_edge_ids_batch)))
                     prev_node_ids_batch = extract_batch_field(batch.get('prev_node_id', [None] * len(cand_edge_ids_batch)))
                     recent_visited_batch = extract_batch_field(batch.get('recent_visited_nodes', [None] * len(cand_edge_ids_batch)))
+                    next_node_ids_batch = extract_batch_field(batch.get('next_node_id', [None] * len(cand_edge_ids_batch)))
+
+                    if args.use_gnn_embedding:
+                        gnn_cur_feat, gnn_cur_neigh, gnn_goal_feat, gnn_goal_neigh = build_gnn_batch_features(
+                            graph_cache, cur_node_ids_batch, goal_node_ids_batch, mainQN.gnn_input_dim
+                        )
+                        gnn_next_feat, gnn_next_neigh, gnn_next_goal_feat, gnn_next_goal_neigh = build_gnn_batch_features(
+                            graph_cache, next_node_ids_batch, goal_node_ids_batch, mainQN.gnn_input_dim
+                        )
+                    else:
+                        gnn_cur_feat = gnn_cur_neigh = gnn_goal_feat = gnn_goal_neigh = None
+                        gnn_next_feat = gnn_next_neigh = gnn_next_goal_feat = gnn_next_goal_neigh = None
 
                     # 为每个batch项重建候选边特征 [batch_size, max_candidates, feature_dim]
                     cand_features_batch = []
@@ -3073,6 +3197,10 @@ if __name__ == '__main__':
                         target_QN.is_training: False,  #  修复：target不用dropout
                         target_QN.training_phase: current_phase,
                         target_QN.rl_weight: rl_weight,
+                        target_QN.gnn_node_feat: gnn_next_feat if gnn_next_feat is not None else np.zeros((len(next_state), target_QN.gnn_input_dim), dtype=np.float32),
+                        target_QN.gnn_neighbor_feat: gnn_next_neigh if gnn_next_neigh is not None else np.zeros((len(next_state), target_QN.gnn_input_dim), dtype=np.float32),
+                        target_QN.gnn_goal_node_feat: gnn_next_goal_feat if gnn_next_goal_feat is not None else np.zeros((len(next_state), target_QN.gnn_input_dim), dtype=np.float32),
+                        target_QN.gnn_goal_neighbor_feat: gnn_next_goal_neigh if gnn_next_goal_neigh is not None else np.zeros((len(next_state), target_QN.gnn_input_dim), dtype=np.float32),
                         mainQN.inputs: next_state,
                         mainQN.len_state: len_next_state,
                         mainQN.action_mask: next_action_masks,
@@ -3081,7 +3209,11 @@ if __name__ == '__main__':
                         mainQN.bc_action_idx: np.full(len(next_state), -1, dtype=np.int32),  # 默认值
                         mainQN.is_training: False,  #  修复：target不用dropout
                         mainQN.training_phase: current_phase,
-                        mainQN.rl_weight: rl_weight
+                        mainQN.rl_weight: rl_weight,
+                        mainQN.gnn_node_feat: gnn_next_feat if gnn_next_feat is not None else np.zeros((len(next_state), mainQN.gnn_input_dim), dtype=np.float32),
+                        mainQN.gnn_neighbor_feat: gnn_next_neigh if gnn_next_neigh is not None else np.zeros((len(next_state), mainQN.gnn_input_dim), dtype=np.float32),
+                        mainQN.gnn_goal_node_feat: gnn_next_goal_feat if gnn_next_goal_feat is not None else np.zeros((len(next_state), mainQN.gnn_input_dim), dtype=np.float32),
+                        mainQN.gnn_goal_neighbor_feat: gnn_next_goal_neigh if gnn_next_goal_neigh is not None else np.zeros((len(next_state), mainQN.gnn_input_dim), dtype=np.float32),
                     }
                     #  Actor-Critic DDPG-style: Get next_states_hidden and target Qs (candidate-based)
                     next_states_hidden, target_Qs_candidates, target_Qs_selector_candidates = sess.run(
@@ -3216,6 +3348,7 @@ if __name__ == '__main__':
                     neighbor_batch_size = len(combined_neighbor_states)
                     neighbor_dummy_cand_features = np.zeros((neighbor_batch_size, mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
                     neighbor_dummy_cand_masks = np.ones((neighbor_batch_size, mainQN.max_candidates), dtype=np.float32)
+                    neighbor_gnn_zeros = np.zeros((neighbor_batch_size, mainQN.gnn_input_dim), dtype=np.float32)
 
                     # Selector Q: 用main Q选择最优动作
                     combined_neighbor_selector_Q = sess.run(mainQN.output1_for_training,
@@ -3228,7 +3361,11 @@ if __name__ == '__main__':
                                                     mainQN.bc_action_idx: np.full(len(combined_neighbor_states), -1, dtype=np.int32),
                                                     mainQN.is_training: False,
                                                     mainQN.training_phase: current_phase,
-                                                    mainQN.rl_weight: rl_weight
+                                                    mainQN.rl_weight: rl_weight,
+                                                    mainQN.gnn_node_feat: neighbor_gnn_zeros,
+                                                    mainQN.gnn_neighbor_feat: neighbor_gnn_zeros,
+                                                    mainQN.gnn_goal_node_feat: neighbor_gnn_zeros,
+                                                    mainQN.gnn_goal_neighbor_feat: neighbor_gnn_zeros,
                                                 })
 
                     # Target Q: 用target Q估值
@@ -3242,7 +3379,11 @@ if __name__ == '__main__':
                                                     target_QN.bc_action_idx: np.full(len(combined_neighbor_states), -1, dtype=np.int32),
                                                     target_QN.is_training: False,
                                                     target_QN.training_phase: current_phase,
-                                                    target_QN.rl_weight: rl_weight
+                                                    target_QN.rl_weight: rl_weight,
+                                                    target_QN.gnn_node_feat: neighbor_gnn_zeros,
+                                                    target_QN.gnn_neighbor_feat: neighbor_gnn_zeros,
+                                                    target_QN.gnn_goal_node_feat: neighbor_gnn_zeros,
+                                                    target_QN.gnn_goal_neighbor_feat: neighbor_gnn_zeros,
                                                 })
                     
                     #  Actor-Critic DDPG-style: Compute Actor target probs for neighbors
@@ -3263,7 +3404,11 @@ if __name__ == '__main__':
                                                         mainQN.bc_action_idx: np.full(len(combined_neighbor_states), -1, dtype=np.int32),
                                                         mainQN.is_training: False,
                                                         mainQN.training_phase: current_phase,
-                                                        mainQN.rl_weight: rl_weight
+                                                        mainQN.rl_weight: rl_weight,
+                                                        mainQN.gnn_node_feat: neighbor_gnn_zeros,
+                                                        mainQN.gnn_neighbor_feat: neighbor_gnn_zeros,
+                                                        mainQN.gnn_goal_node_feat: neighbor_gnn_zeros,
+                                                        mainQN.gnn_goal_neighbor_feat: neighbor_gnn_zeros,
                                                     })
                         
                         #  Actor-Critic DDPG-style: Compute Actor target probs for neighbors
@@ -3384,6 +3529,10 @@ if __name__ == '__main__':
                             mainQN.is_training: False,
                             mainQN.training_phase: current_phase,
                             mainQN.rl_weight: rl_weight,
+                            mainQN.gnn_node_feat: gnn_cur_feat if gnn_cur_feat is not None else np.zeros((len(state), mainQN.gnn_input_dim), dtype=np.float32),
+                            mainQN.gnn_neighbor_feat: gnn_cur_neigh if gnn_cur_neigh is not None else np.zeros((len(state), mainQN.gnn_input_dim), dtype=np.float32),
+                            mainQN.gnn_goal_node_feat: gnn_goal_feat if gnn_goal_feat is not None else np.zeros((len(state), mainQN.gnn_input_dim), dtype=np.float32),
+                            mainQN.gnn_goal_neighbor_feat: gnn_goal_neigh if gnn_goal_neigh is not None else np.zeros((len(state), mainQN.gnn_input_dim), dtype=np.float32),
                         }
                     )
                     top1_preds = np.argmax(predictions, axis=1)
@@ -3639,6 +3788,10 @@ if __name__ == '__main__':
                                             cand_mask=cand_masks_batch,         #  新增：候选边mask
                                             bc_action_idx=bc_action_idx_batch,  #  新增：候选边动作索引
                                             rl_action_cand_idx=rl_action_cand_idx_batch,  #  新增：RL候选边动作索引
+                                            gnn_node_feat=gnn_cur_feat,
+                                            gnn_neighbor_feat=gnn_cur_neigh,
+                                            gnn_goal_node_feat=gnn_goal_feat,
+                                            gnn_goal_neighbor_feat=gnn_goal_neigh,
                                             is_training=True)
                 
                 
@@ -3773,6 +3926,31 @@ if __name__ == '__main__':
                         expert_cand_features = np.array(expert_cand_features)
                         expert_cand_masks = np.array(expert_cand_masks)
 
+                        if args.use_gnn_embedding:
+                            expert_cur_node_ids = []
+                            expert_goal_node_ids = []
+                            for b in range(len(expert_state)):
+                                cur_node_id = None
+                                goal_node_id = None
+                                if 'cur_node_id' in expert_batch:
+                                    if isinstance(expert_batch['cur_node_id'], dict):
+                                        cur_node_id = list(expert_batch['cur_node_id'].values())[b]
+                                    else:
+                                        cur_node_id = expert_batch['cur_node_id'][b] if b < len(expert_batch['cur_node_id']) else None
+                                if 'goal_node_id' in expert_batch:
+                                    if isinstance(expert_batch['goal_node_id'], dict):
+                                        goal_node_id = list(expert_batch['goal_node_id'].values())[b]
+                                    else:
+                                        goal_node_id = expert_batch['goal_node_id'][b] if b < len(expert_batch['goal_node_id']) else None
+                                expert_cur_node_ids.append(cur_node_id)
+                                expert_goal_node_ids.append(goal_node_id)
+
+                            gnn_expert_cur, gnn_expert_cur_neigh, gnn_expert_goal, gnn_expert_goal_neigh = build_gnn_batch_features(
+                                graph_cache, expert_cur_node_ids, expert_goal_node_ids, mainQN.gnn_input_dim
+                            )
+                        else:
+                            gnn_expert_cur = gnn_expert_cur_neigh = gnn_expert_goal = gnn_expert_goal_neigh = None
+
                         expert_feed_dict = {
                             mainQN.inputs: expert_state,
                             mainQN.len_state: expert_len_state,
@@ -3785,6 +3963,10 @@ if __name__ == '__main__':
                             mainQN.training_phase: current_phase,
                             mainQN.rl_weight: rl_weight,
                             mainQN.actor_rl_weight: args.actor_rl_weight,  #  Actor RL辅损权重 λ_RL
+                            mainQN.gnn_node_feat: gnn_expert_cur if gnn_expert_cur is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
+                            mainQN.gnn_neighbor_feat: gnn_expert_cur_neigh if gnn_expert_cur_neigh is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
+                            mainQN.gnn_goal_node_feat: gnn_expert_goal if gnn_expert_goal is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
+                            mainQN.gnn_goal_neighbor_feat: gnn_expert_goal_neigh if gnn_expert_goal_neigh is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
                             # Dummy values for RL-related placeholders (not used in SL training)
                             mainQN.targetQs_: np.zeros((len(expert_state), mainQN.max_candidates), dtype=np.float32),
                             mainQN.reward: np.zeros(len(expert_state), dtype=np.float32),
@@ -3988,6 +4170,10 @@ if __name__ == '__main__':
                                         mainQN.is_training: False,
                                         mainQN.training_phase: current_phase,
                                         mainQN.rl_weight: rl_weight,
+                                        mainQN.gnn_node_feat: gnn_expert_cur if 'gnn_expert_cur' in locals() and gnn_expert_cur is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
+                                        mainQN.gnn_neighbor_feat: gnn_expert_cur_neigh if 'gnn_expert_cur_neigh' in locals() and gnn_expert_cur_neigh is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
+                                        mainQN.gnn_goal_node_feat: gnn_expert_goal if 'gnn_expert_goal' in locals() and gnn_expert_goal is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
+                                        mainQN.gnn_goal_neighbor_feat: gnn_expert_goal_neigh if 'gnn_expert_goal_neigh' in locals() and gnn_expert_goal_neigh is not None else np.zeros((len(expert_state), mainQN.gnn_input_dim), dtype=np.float32),
                                     }
                                 )
                                 expert_top1_preds = np.argmax(expert_predictions, axis=1)

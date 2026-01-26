@@ -48,6 +48,9 @@ class GraphCache:
         # Metadata
         self.coord_stats: Optional[Dict[str, float]] = None
         self.physical_stats: Optional[Dict[str, float]] = None
+        self.max_out_degree: int = 1
+        self.node_feature_cache: Dict[int, np.ndarray] = {}
+        self.node_neighbor_feature_cache: Dict[int, np.ndarray] = {}
 
     def build_from_networkx(self, G: nx.Graph, edge_id_map: Dict[Tuple, int],
                           edge_feature_list: List[List[float]],
@@ -100,9 +103,12 @@ class GraphCache:
             self.edge_attrs[edge_id] = dict(zip(edge_attr_keys, features))
 
         # Compute node attributes
+        max_out_degree = 1
         for node_id in self.node_coords.keys():
             out_degree = len(self.node_out_edges.get(node_id, []))
             self.node_attrs[node_id] = {'out_degree': out_degree}
+            max_out_degree = max(max_out_degree, out_degree)
+        self.max_out_degree = max_out_degree
 
     def get_candidate_edges(self, node_id: int) -> List[int]:
         """
@@ -139,6 +145,75 @@ class GraphCache:
             Dictionary of node attributes
         """
         return self.node_attrs.get(node_id, {}).copy()
+
+    def get_node_feature_vector(self, node_id: int) -> np.ndarray:
+        """
+        Get a node feature vector for GNN-style encoders.
+
+        Features are structural/statistical only (no IDs):
+        [out_degree_norm, avg_length_norm, avg_width, avg_curb_norm, avg_crossing]
+        """
+        if node_id in self.node_feature_cache:
+            return self.node_feature_cache[node_id].copy()
+
+        node_attr = self.node_attrs.get(node_id, {})
+        out_degree = float(node_attr.get('out_degree', 0.0))
+        out_degree_norm = out_degree / max(self.max_out_degree, 1)
+
+        edge_ids = self.node_out_edges.get(node_id, [])
+        if not edge_ids:
+            features = np.array([out_degree_norm, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            self.node_feature_cache[node_id] = features
+            return features.copy()
+
+        length_norms = []
+        widths = []
+        curb_norms = []
+        crossings = []
+        for edge_id in edge_ids:
+            edge_attr = self.edge_attrs.get(edge_id, {})
+            length_norms.append(edge_attr.get('length_norm', 0.0))
+            widths.append(edge_attr.get('width', 0.0))
+            curb_norms.append(edge_attr.get('curb_norm', 0.0))
+            crossings.append(float(edge_attr.get('crossing', 0.0)))
+
+        features = np.array([
+            out_degree_norm,
+            float(np.mean(length_norms)),
+            float(np.mean(widths)),
+            float(np.mean(curb_norms)),
+            float(np.mean(crossings)),
+        ], dtype=np.float32)
+        self.node_feature_cache[node_id] = features
+        return features.copy()
+
+    def get_neighbor_feature_mean(self, node_id: int) -> np.ndarray:
+        """
+        Mean feature vector over neighboring nodes (1-hop), for GNN-style aggregation.
+        """
+        if node_id in self.node_neighbor_feature_cache:
+            return self.node_neighbor_feature_cache[node_id].copy()
+
+        edge_ids = self.node_out_edges.get(node_id, [])
+        if not edge_ids:
+            neighbor_features = np.zeros(5, dtype=np.float32)
+            self.node_neighbor_feature_cache[node_id] = neighbor_features
+            return neighbor_features.copy()
+
+        neighbor_ids = set()
+        for edge_id in edge_ids:
+            u_id, v_id = self.edge_id_to_nodes[edge_id]
+            neighbor_ids.add(v_id if u_id == node_id else u_id)
+
+        if not neighbor_ids:
+            neighbor_features = np.zeros(5, dtype=np.float32)
+            self.node_neighbor_feature_cache[node_id] = neighbor_features
+            return neighbor_features.copy()
+
+        stacked = np.stack([self.get_node_feature_vector(n_id) for n_id in neighbor_ids], axis=0)
+        neighbor_features = np.mean(stacked, axis=0).astype(np.float32)
+        self.node_neighbor_feature_cache[node_id] = neighbor_features
+        return neighbor_features.copy()
 
     def get_edge_nodes(self, edge_id: int) -> Tuple[int, int]:
         """
