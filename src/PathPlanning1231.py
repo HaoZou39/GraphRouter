@@ -1249,6 +1249,31 @@ class ImprovedQNetwork:
                                       if var not in self.q_head_vars and var not in self.sl_head_vars]
                        
             # 损失组件监控
+            # 🔥 修复：只对有效候选边计算Q值统计（避免无效动作的-1e9影响统计）
+            # 使用cand_mask过滤有效候选边
+            valid_q_values = tf.boolean_mask(self.output1_candidates, tf.cast(self.cand_mask, tf.bool))
+            # 如果所有候选边都无效，使用默认值避免除零错误
+            valid_q_mean = tf.cond(
+                tf.size(valid_q_values) > 0,
+                lambda: tf.reduce_mean(valid_q_values),
+                lambda: tf.constant(0.0, dtype=tf.float32)
+            )
+            valid_q_std = tf.cond(
+                tf.size(valid_q_values) > 0,
+                lambda: tf.math.reduce_std(valid_q_values),
+                lambda: tf.constant(0.0, dtype=tf.float32)
+            )
+            valid_q_min = tf.cond(
+                tf.size(valid_q_values) > 0,
+                lambda: tf.reduce_min(valid_q_values),
+                lambda: tf.constant(0.0, dtype=tf.float32)
+            )
+            valid_q_max = tf.cond(
+                tf.size(valid_q_values) > 0,
+                lambda: tf.reduce_max(valid_q_values),
+                lambda: tf.constant(0.0, dtype=tf.float32)
+            )
+            
             self.loss_components = {
                 'total_loss': self.balanced_loss,
                 'balanced_loss': self.balanced_loss,
@@ -1274,14 +1299,14 @@ class ImprovedQNetwork:
                 'training_phase': self.training_phase,
                 'rl_weight': self.rl_weight,
                 'mask_penalty': self.mask_penalty_value,
-                'q_value_range': q_value_range,
-                'q_value_min': q_value_min,
-                'q_value_max': tf.reduce_max(self.output1_masked),
-                'q_value_mean': tf.reduce_mean(self.output1_masked),
-                'q_value_std': tf.math.reduce_std(self.output1_masked),
+                'q_value_range': valid_q_max - valid_q_min,  # 只计算有效候选边的范围
+                'q_value_min': valid_q_min,  # 只计算有效候选边的最小值
+                'q_value_max': valid_q_max,  # 只计算有效候选边的最大值
+                'q_value_mean': valid_q_mean,  # 只计算有效候选边的均值
+                'q_value_std': valid_q_std,  # 只计算有效候选边的标准差
                 'q_value_unmasked_max': tf.reduce_max(self.output1),
                 'q_value_unmasked_min': tf.reduce_min(self.output1),
-                'mask_penalty_gap': q_value_min - self.mask_penalty_value,
+                'mask_penalty_gap': valid_q_min - self.mask_penalty_value,
                 'q_head_var_count': tf.constant(len(self.q_head_vars), dtype=tf.int32),
                 'sl_head_var_count': tf.constant(len(self.sl_head_vars), dtype=tf.int32),
                 'shared_encoder_var_count': tf.constant(len(self.shared_encoder_vars), dtype=tf.int32),
@@ -1705,7 +1730,6 @@ if __name__ == '__main__':
         multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
         graph_cache = multi_cache.get_cache(args.graph_id)
         feature_builder = multi_cache.get_feature_builder(args.graph_id)
-        print(f' Loaded GraphCache and FeatureBuilder for graph "{args.graph_id}"')
     except Exception as e:
         raise Exception(f'Could not load GraphCache/FeatureBuilder: {e}')
         print(f'  Could not load GraphCache/FeatureBuilder: {e}')
@@ -2042,7 +2066,7 @@ if __name__ == '__main__':
         num_batches=int(num_rows/args.batch_size)
         
         #  计算 Phase-1 的总步数（基于epoch数）
-        min_sl_steps = 1000
+        min_sl_steps = 250
         steps_per_epoch = num_batches
         args.phase1_sl_only_steps = max(min_sl_steps, args.phase1_epochs * steps_per_epoch)
         print(f" Calculated phase1_sl_only_steps = max({min_sl_steps}, {args.phase1_epochs} epochs × {steps_per_epoch} steps/epoch) = {args.phase1_sl_only_steps} steps")
@@ -2723,46 +2747,54 @@ if __name__ == '__main__':
                         
                         # Sample from on-policy (O-bucket) with stratified sampling (6:4 success:non-success)
                         # Random start-end mode: sample from all tasks
-                        onpolicy_samples = onpolicy_buffer.sample(n=n_onpolicy)                    
-                        # Combine for RL training
-                        # Handle both dict and list formats for expert_rl_batch
-                        #  修复：新格式使用'taken_edge_id'，旧格式使用'action'
-                        action_key = 'taken_edge_id' if 'taken_edge_id' in expert_rl_batch else 'action'
+                        onpolicy_samples = onpolicy_buffer.sample(n=n_onpolicy) if onpolicy_buffer.size() > 0 else []
                         
-                        if isinstance(expert_rl_batch['state'], dict):
-                            expert_states = list(expert_rl_batch['state'].values())
-                            expert_actions = list(expert_rl_batch[action_key].values())
-                            expert_next_states = list(expert_rl_batch['next_state'].values())
-                            expert_len_states = list(expert_rl_batch['len_state'].values())
-                            expert_len_next_states = list(expert_rl_batch['len_next_state'].values())
-                            expert_is_dones = list(expert_rl_batch.get('done', expert_rl_batch.get('is_done', {})).values())
+                        # 🔥 修复：如果O-bucket为空，只使用expert数据，并调整batch size
+                        if len(onpolicy_samples) == 0:
+                            # O-bucket为空，只使用expert数据
+                            rl_batch = expert_batch
+                            if global_step % args.log_frequency == 0:
+                                print(f"   ⚠️  O-bucket is empty, using only expert data for RL training")
                         else:
-                            expert_states = expert_rl_batch['state']
-                            expert_actions = expert_rl_batch[action_key]
-                            expert_next_states = expert_rl_batch['next_state']
-                            expert_len_states = expert_rl_batch['len_state']
-                            expert_len_next_states = expert_rl_batch['len_next_state']
-                            expert_is_dones = expert_rl_batch.get('done', expert_rl_batch.get('is_done', [False] * len(expert_states)))
-                        
-                        #  修复：处理新格式（taken_edge_id）和旧格式（action）
-                        onpolicy_actions = []
-                        for t in onpolicy_samples:
-                            if 'taken_edge_id' in t:
-                                onpolicy_actions.append(t['taken_edge_id'])
-                            elif 'action' in t:
-                                onpolicy_actions.append(t['action'])
+                            # Combine for RL training
+                            # Handle both dict and list formats for expert_rl_batch
+                            #  修复：新格式使用'taken_edge_id'，旧格式使用'action'
+                            action_key = 'taken_edge_id' if 'taken_edge_id' in expert_rl_batch else 'action'
+                            
+                            if isinstance(expert_rl_batch['state'], dict):
+                                expert_states = list(expert_rl_batch['state'].values())
+                                expert_actions = list(expert_rl_batch[action_key].values())
+                                expert_next_states = list(expert_rl_batch['next_state'].values())
+                                expert_len_states = list(expert_rl_batch['len_state'].values())
+                                expert_len_next_states = list(expert_rl_batch['len_next_state'].values())
+                                expert_is_dones = list(expert_rl_batch.get('done', expert_rl_batch.get('is_done', {})).values())
                             else:
-                                # 如果都没有，使用0作为默认值
-                                onpolicy_actions.append(0)
-                        
-                        rl_batch = {
-                            'state': expert_states + [t['state'] for t in onpolicy_samples],
-                            action_key: expert_actions + onpolicy_actions,  # 使用统一的键
-                            'next_state': expert_next_states + [t['next_state'] for t in onpolicy_samples],
-                            'len_state': expert_len_states + [t['len_state'] for t in onpolicy_samples],
-                            'len_next_state': expert_len_next_states + [t['len_next_state'] for t in onpolicy_samples],
-                            'is_done': expert_is_dones + [t.get('done', t.get('is_done', False)) for t in onpolicy_samples]
-                        }
+                                expert_states = expert_rl_batch['state']
+                                expert_actions = expert_rl_batch[action_key]
+                                expert_next_states = expert_rl_batch['next_state']
+                                expert_len_states = expert_rl_batch['len_state']
+                                expert_len_next_states = expert_rl_batch['len_next_state']
+                                expert_is_dones = expert_rl_batch.get('done', expert_rl_batch.get('is_done', [False] * len(expert_states)))
+                            
+                            #  修复：处理新格式（taken_edge_id）和旧格式（action）
+                            onpolicy_actions = []
+                            for t in onpolicy_samples:
+                                if 'taken_edge_id' in t:
+                                    onpolicy_actions.append(t['taken_edge_id'])
+                                elif 'action' in t:
+                                    onpolicy_actions.append(t['action'])
+                                else:
+                                    # 如果都没有，使用0作为默认值
+                                    onpolicy_actions.append(0)
+                            
+                            rl_batch = {
+                                'state': expert_states + [t['state'] for t in onpolicy_samples],
+                                action_key: expert_actions + onpolicy_actions,  # 使用统一的键
+                                'next_state': expert_next_states + [t['next_state'] for t in onpolicy_samples],
+                                'len_state': expert_len_states + [t['len_state'] for t in onpolicy_samples],
+                                'len_next_state': expert_len_next_states + [t['len_next_state'] for t in onpolicy_samples],
+                                'is_done': expert_is_dones + [t.get('done', t.get('is_done', False)) for t in onpolicy_samples]
+                            }
                     else:
                         # Phase 1 or empty O-bucket: RL uses only expert data
                         rl_batch = expert_batch
@@ -3339,18 +3371,15 @@ if __name__ == '__main__':
                         neighbor_target_Qs[neighbor_idx][invalid_mask] = 0.0
                         neighbor_selector_Qs[neighbor_idx][invalid_mask] = 0.0
 
-                    # 为当前状态创建虚拟候选边特征
-                    current_dummy_cand_features = np.zeros((len(state), mainQN.max_candidates, mainQN.cand_feature_dim), dtype=np.float32)
-                    current_dummy_cand_masks = np.ones((len(state), mainQN.max_candidates), dtype=np.float32)
-
+                    # 使用重建的真实候选边特征进行预测（而不是虚拟零向量）
                     predictions = sess.run(
                         mainQN.probs,
                         feed_dict={
                             mainQN.inputs: state,
                             mainQN.len_state: len_state,
                             mainQN.action_mask: current_action_masks,
-                            mainQN.cand_features: current_dummy_cand_features,
-                            mainQN.cand_mask: current_dummy_cand_masks,
+                            mainQN.cand_features: cand_features_batch,  # 使用重建的真实候选边特征
+                            mainQN.cand_mask: cand_masks_batch,  # 使用重建的真实候选边mask
                             mainQN.bc_action_idx: np.full(len(state), -1, dtype=np.int32),
                             mainQN.is_training: False,
                             mainQN.training_phase: current_phase,
@@ -3576,6 +3605,10 @@ if __name__ == '__main__':
                     # 转换为numpy数组
                     batch_cand_features = np.array(batch_cand_features)  # [batch_size, max_candidates, feature_dim]
                     batch_cand_masks = np.array(batch_cand_masks)      # [batch_size, max_candidates]
+                    
+                    # 🔥 修复：使用正确的变量名（batch_cand_features -> cand_features_batch）
+                    cand_features_batch = batch_cand_features
+                    cand_masks_batch = batch_cand_masks
 
                     #  计算RL训练的候选边动作索引：将全局edge_id转换为候选边索引
                     rl_action_cand_idx_batch = []
@@ -3814,8 +3847,13 @@ if __name__ == '__main__':
                         
                         # 在线策略缓冲区统计（只在log_frequency时打印）
                         if current_phase >= 2:
+                            # 🔥 修复：显示实际的on-policy样本数量，而不是期望的数量
+                            actual_onpolicy_samples = onpolicy_size if onpolicy_size > 0 else 0
+                            actual_mix_ratio = actual_onpolicy_samples / args.batch_size if args.batch_size > 0 else 0.0
                             print(f"   O-bucket: {onpolicy_size}/{args.onpolicy_buffer_size} "
-                                f"(mix={onpolicy_ratio_actual:.2f}, {int(args.batch_size * args.onpolicy_mix_ratio)}/{args.batch_size} samples)")
+                                f"(mix={actual_mix_ratio:.2f}, actual={actual_onpolicy_samples}/{args.batch_size} samples)")
+                            if onpolicy_size == 0:
+                                print(f"   ⚠️  Warning: O-bucket is empty! RL training uses only expert data.")
                         
                         # 提取Q值统计信息
                         q_value_range = tensor_to_scalar(loss_components['q_value_range'])
@@ -3972,7 +4010,67 @@ if __name__ == '__main__':
                             if bc_action_idx_batch is not None and len(bc_action_idx_batch) == len(top1_preds):
                                 # 使用BC索引作为ground truth（候选边空间）
                                 correct_predictions = np.sum(top1_preds == bc_action_idx_batch)
-                                print(f"  [DEBUG] Training accuracy calculation: correct={correct_predictions}/{len(bc_action_idx_batch)}, bc_action_idx_batch[:5]={bc_action_idx_batch[:5]}, top1_preds[:5]={top1_preds[:5]}")
+                                # 🔥 改进调试信息：显示更多统计信息
+                                if global_step % args.log_frequency == 0:
+                                    unique_preds = np.unique(top1_preds)
+                                    pred_distribution = {pred: np.sum(top1_preds == pred) for pred in unique_preds[:10]}
+                                    print(f"  [DEBUG] Training accuracy: {correct_predictions}/{len(bc_action_idx_batch)} = {correct_predictions/len(bc_action_idx_batch):.4f}")
+                                    print(f"  [DEBUG] Prediction distribution (top 10): {pred_distribution}")
+                                    print(f"  [DEBUG] Ground truth sample: {bc_action_idx_batch[:10]}")
+                                    print(f"  [DEBUG] Predictions sample: {top1_preds[:10]}")
+                                    # 检查predictions的分布
+                                    if len(predictions) > 0:
+                                        max_probs = np.max(predictions, axis=1)
+                                        print(f"  [DEBUG] Max probability stats: mean={np.mean(max_probs):.4f}, std={np.std(max_probs):.4f}, min={np.min(max_probs):.4f}, max={np.max(max_probs):.4f}")
+                                    
+                                    # 🔥 新增：详细的数据质量诊断
+                                    # 1. 候选边数量统计
+                                    if cand_edge_ids_batch is not None:
+                                        cand_counts = [len(cand_edge_ids) for cand_edge_ids in cand_edge_ids_batch]
+                                        print(f"  [DIAG] Candidate count stats: min={min(cand_counts)}, max={max(cand_counts)}, mean={np.mean(cand_counts):.2f}, std={np.std(cand_counts):.2f}")
+                                    
+                                    # 2. bc_action_idx分布
+                                    unique_gt, counts_gt = np.unique(bc_action_idx_batch, return_counts=True)
+                                    gt_distribution = dict(zip(unique_gt, counts_gt))
+                                    print(f"  [DIAG] Ground truth distribution: {gt_distribution}")
+                                    
+                                    # 3. 按候选索引分组的准确率
+                                    print(f"  [DIAG] Accuracy by candidate index:")
+                                    for idx in range(mainQN.max_candidates):
+                                        mask = bc_action_idx_batch == idx
+                                        if np.sum(mask) > 0:
+                                            acc = np.mean(top1_preds[mask] == bc_action_idx_batch[mask])
+                                            count = np.sum(mask)
+                                            print(f"    idx={idx}: acc={acc:.4f} ({count}/{len(bc_action_idx_batch)} samples)")
+                                    
+                                    # 4. 预测正确/错误时的置信度对比
+                                    if len(predictions) > 0:
+                                        correct_mask = top1_preds == bc_action_idx_batch
+                                        correct_max_probs = max_probs[correct_mask]
+                                        wrong_max_probs = max_probs[~correct_mask]
+                                        if len(correct_max_probs) > 0 and len(wrong_max_probs) > 0:
+                                            print(f"  [DIAG] Confidence analysis:")
+                                            print(f"    Correct predictions: mean={np.mean(correct_max_probs):.4f}, std={np.std(correct_max_probs):.4f}")
+                                            print(f"    Wrong predictions: mean={np.mean(wrong_max_probs):.4f}, std={np.std(wrong_max_probs):.4f}")
+                                    
+                                    # 5. 候选边特征质量检查（采样检查）
+                                    if cand_edge_ids_batch is not None and len(cand_edge_ids_batch) > 0:
+                                        # 尝试获取候选边特征（可能在feed_dict构建之前或之后）
+                                        sample_cand_features = None
+                                        if 'cand_features_batch' in locals() and cand_features_batch is not None:
+                                            sample_cand_features = cand_features_batch[0]
+                                        elif 'batch_cand_features' in locals() and batch_cand_features is not None:
+                                            sample_cand_features = batch_cand_features[0]
+                                        
+                                        if sample_cand_features is not None:
+                                            # 检查是否有NaN或全0特征
+                                            has_nan = np.isnan(sample_cand_features).any()
+                                            has_zero = np.all(sample_cand_features == 0, axis=-1).any()
+                                            feature_mean = np.mean(np.abs(sample_cand_features))
+                                            feature_std = np.std(sample_cand_features)
+                                            print(f"  [DIAG] Candidate features quality (sample):")
+                                            print(f"    Has NaN: {has_nan}, Has all-zero rows: {has_zero}")
+                                            print(f"    Feature stats: mean={feature_mean:.4f}, std={feature_std:.4f}")
                             else:
                                 # 回退到旧方法（全局edge IDs）- 仅用于兼容性
                                 raise Exception('bc_action_idx_batch not found')
@@ -3982,7 +4080,7 @@ if __name__ == '__main__':
                         # 计算accuracy
                         accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
 
-                        # 调试：检查数据质量
+                        # 调试：检查数据质量（只在初期打印，详细诊断在上面已添加）
                         if global_step <= 50:  # 只在初期打印
                             print(f"  [DEBUG] Data quality check:")
                             print(f"    bc_action_idx_batch shape: {bc_action_idx_batch.shape if bc_action_idx_batch is not None else 'None'}")

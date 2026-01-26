@@ -1487,24 +1487,49 @@ def precollect_obuffer_at_phase2_transition(sess, model, onpolicy_buffer, data_d
                     # 调试：打印一些样本数据
                     if len(start_end_pairs_with_user) < 3:  # 只打印前几个
                         print(f"   🔍 Sample data: cur_node_id={start_node_id}, goal_node_id={end_node_id}")
-                    # 将node_id转换为坐标（如果有edge_id_map）
-                    if edge_id_map is not None and G is not None:
+                    # 将node_id转换为坐标（优先使用graph_cache，回退到G）
+                    start_pos = None
+                    end_pos = None
+                    
+                    # 尝试从graph_cache获取坐标（跨图兼容）
+                    try:
+                        from utils.graph_cache import MultiGraphCache
+                        multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
+                        graph_cache = multi_cache.get_cache(args.graph_id if hasattr(args, 'graph_id') else 'default_graph')
+                        
+                        if start_node_id in graph_cache.node_coords and end_node_id in graph_cache.node_coords:
+                            start_coord = graph_cache.node_coords[start_node_id]
+                            end_coord = graph_cache.node_coords[end_node_id]
+                            start_pos = (start_coord[0], start_coord[1])
+                            end_pos = (end_coord[0], end_coord[1])
+                    except Exception as e:
+                        # 如果graph_cache不可用，回退到G
+                        pass
+                    
+                    # 如果graph_cache失败，尝试从G获取坐标
+                    if start_pos is None and edge_id_map is not None and G is not None:
                         try:
                             start_pos = (G.nodes[start_node_id]['x'], G.nodes[start_node_id]['y'])
                             end_pos = (G.nodes[end_node_id]['x'], G.nodes[end_node_id]['y'])
-                            start_x, start_y = start_pos
-                            end_x, end_y = end_pos
-                            if len(start_end_pairs_with_user) < 3:  # 只打印前几个
-                                print(f"   ✅ Coordinates: ({start_x:.2f}, {start_y:.2f}) -> ({end_x:.2f}, {end_y:.2f})")
-                        except KeyError as e:
+                        except (KeyError, TypeError) as e:
                             # 调试：打印错误信息
-                            print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: {e}")
+                            if len(start_end_pairs_with_user) < 3:  # 只打印前几个
+                                print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: {e}")
                             if len(start_end_pairs_with_user) < 1:  # 只打印一次
-                                print(f"   Available nodes: {list(G.nodes())[:10]}...")  # 只显示前10个
+                                if G is not None:
+                                    available_nodes = list(G.nodes())[:10]
+                                    print(f"   Available nodes in G: {available_nodes}...")
                             continue  # 跳过无效的node_id
-                    else:
-                        print(f"   ⚠️  Missing graph data (edge_id_map or G is None)")
-                        continue  # 如果没有图数据，跳过
+                    
+                    if start_pos is None or end_pos is None:
+                        if len(start_end_pairs_with_user) < 3:  # 只打印前几个
+                            print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: node not found")
+                        continue  # 跳过无效的node_id
+                    
+                    start_x, start_y = start_pos
+                    end_x, end_y = end_pos
+                    if len(start_end_pairs_with_user) < 3:  # 只打印前几个
+                        print(f"   ✅ Coordinates: ({start_x:.2f}, {start_y:.2f}) -> ({end_x:.2f}, {end_y:.2f})")
                 elif 'action' in row:
                     # 旧格式：从action数组提取坐标
                     action = row['action']
@@ -1543,25 +1568,50 @@ def precollect_obuffer_at_phase2_transition(sess, model, onpolicy_buffer, data_d
                     # 调试：打印一些样本数据
                     if len(start_end_pairs) < 3:  # 只打印前几个
                         print(f"   🔍 Sample data: cur_node_id={start_node_id}, goal_node_id={end_node_id}")
-                    # 将node_id转换为坐标（如果有edge_id_map）
-                    if edge_id_map is not None and G is not None:
+                    # 将node_id转换为坐标（优先使用graph_cache，回退到G）
+                    start_pos = None
+                    end_pos = None
+                    
+                    # 尝试从graph_cache获取坐标（跨图兼容）
+                    try:
+                        from utils.graph_cache import MultiGraphCache
+                        multi_cache = MultiGraphCache(os.path.join(data_directory, 'graph_data'))
+                        graph_cache = multi_cache.get_cache(args.graph_id if hasattr(args, 'graph_id') else 'default_graph')
+                        
+                        if start_node_id in graph_cache.node_coords and end_node_id in graph_cache.node_coords:
+                            start_coord = graph_cache.node_coords[start_node_id]
+                            end_coord = graph_cache.node_coords[end_node_id]
+                            start_pos = (start_coord[0], start_coord[1])
+                            end_pos = (end_coord[0], end_coord[1])
+                    except Exception as e:
+                        # 如果graph_cache不可用，回退到G
+                        pass
+                    
+                    # 如果graph_cache失败，尝试从G获取坐标
+                    if start_pos is None and edge_id_map is not None and G is not None:
                         try:
                             start_pos = (G.nodes[start_node_id]['x'], G.nodes[start_node_id]['y'])
                             end_pos = (G.nodes[end_node_id]['x'], G.nodes[end_node_id]['y'])
-                            start_x, start_y = start_pos
-                            end_x, end_y = end_pos
-                            start_end_pairs.add(((start_x, start_y), (end_x, end_y)))
-                            if len(start_end_pairs) <= 3:  # 只打印前几个
-                                print(f"   ✅ Coordinates: ({start_x:.2f}, {start_y:.2f}) -> ({end_x:.2f}, {end_y:.2f})")
-                        except KeyError as e:
+                        except (KeyError, TypeError) as e:
                             # 调试：打印错误信息
-                            print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: {e}")
+                            if len(start_end_pairs) < 3:  # 只打印前几个
+                                print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: {e}")
                             if len(start_end_pairs) < 1:  # 只打印一次
-                                print(f"   Available nodes: {list(G.nodes())[:10]}...")  # 只显示前10个
+                                if G is not None:
+                                    available_nodes = list(G.nodes())[:10]
+                                    print(f"   Available nodes in G: {available_nodes}...")
                             continue  # 跳过无效的node_id
-                    else:
-                        print(f"   ⚠️  Missing graph data (edge_id_map or G is None)")
-                        continue  # 如果没有图数据，跳过
+                    
+                    if start_pos is None or end_pos is None:
+                        if len(start_end_pairs) < 3:  # 只打印前几个
+                            print(f"   ⚠️  Failed to get coordinates for nodes {start_node_id}->{end_node_id}: node not found")
+                        continue  # 跳过无效的node_id
+                    
+                    start_x, start_y = start_pos
+                    end_x, end_y = end_pos
+                    start_end_pairs.add(((start_x, start_y), (end_x, end_y)))
+                    if len(start_end_pairs) <= 3:  # 只打印前几个
+                        print(f"   ✅ Coordinates: ({start_x:.2f}, {start_y:.2f}) -> ({end_x:.2f}, {end_y:.2f})")
                 elif 'action' in row:
                     # 旧格式：从action数组提取坐标
                     action = row['action']

@@ -65,11 +65,18 @@ class FeatureBuilder:
         d_cur = self.graph_cache.get_dist_to_goal(cur_node_id, goal_node_id)
 
         # 获取坐标（用于方向计算）
+        if cur_node_id not in self.graph_cache.node_coords:
+            raise ValueError(f"Current node {cur_node_id} not found in graph_cache.node_coords")
+        if goal_node_id not in self.graph_cache.node_coords:
+            raise ValueError(f"Goal node {goal_node_id} not found in graph_cache.node_coords")
+        
         cur_coord = self.graph_cache.node_coords[cur_node_id]
         goal_coord = self.graph_cache.node_coords[goal_node_id]
 
         # 计算参考方向
         if prev_node_id is not None and not (isinstance(prev_node_id, float) and np.isnan(prev_node_id)):
+            if prev_node_id not in self.graph_cache.node_coords:
+                raise ValueError(f"Previous node {prev_node_id} not found in graph_cache.node_coords")
             prev_coord = self.graph_cache.node_coords[prev_node_id]
             ref_vec = np.array([cur_coord[0] - prev_coord[0],
                                cur_coord[1] - prev_coord[1]])
@@ -81,6 +88,8 @@ class FeatureBuilder:
         for edge_id in cand_edge_ids:
             edge_attr = self.graph_cache.get_edge_attr(edge_id)
             u_id, v_id = self.graph_cache.get_edge_nodes(edge_id)
+            if v_id not in self.graph_cache.node_coords:
+                raise ValueError(f"Next node {v_id} (from edge {edge_id}) not found in graph_cache.node_coords")
             next_coord = self.graph_cache.node_coords[v_id]
 
             # 边属性
