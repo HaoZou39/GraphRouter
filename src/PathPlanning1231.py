@@ -28,7 +28,7 @@ except ImportError as e:
 def parse_args():
     parser = argparse.ArgumentParser(description="Run improved LLM4Rec with better reward design.")
 
-    parser.add_argument('--epoch', type=int, default=10,
+    parser.add_argument('--epoch', type=int, default=120,
                         help='Number of max epochs.')
     parser.add_argument('--data', nargs='?', default='../data',
                         help='data directory')
